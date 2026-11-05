@@ -1026,7 +1026,7 @@ export default function Home() {
   setTrackingRef.current = setTracking;
 
   // ---- GPS 자동 감지: 움직이면 타이머 정지, 멈추면 "앉아 계신가요?" 질문 ----
-  const handleToggleAutoDetect = () => {
+  const handleToggleAutoDetect = async () => {
     if (autoDetect) {
       setAutoDetect(false);
       setAutoPaused(false);
@@ -1035,15 +1035,23 @@ export default function Home() {
     }
     if (!gpsSupported) { setGpsMsg("https 또는 localhost 접속에서만 쓸 수 있어요"); return; }
     // 아이폰은 사용자가 누를 때 센서 권한을 따로 물어봐야 함 (거부해도 GPS만으로 동작)
+    setGpsMsg("위치를 확인하는 중이에요…");
     const DM = (window as any).DeviceMotionEvent;
-    if (DM && typeof DM.requestPermission === "function") DM.requestPermission().catch(() => {});
+    // 두 권한 창이 동시에 뜨면 꼬이므로 모션 권한을 먼저 끝내고 위치를 물어봄
+    if (DM && typeof DM.requestPermission === "function") {
+      try { await DM.requestPermission(); } catch { /* 거부해도 GPS만으로 동작 */ }
+    }
     navigator.geolocation.getCurrentPosition(
       () => {
         setAutoDetect(true);
         try { localStorage.setItem("sijakjeom_autodetect", "on"); } catch { /* 무시 */ }
       },
-      (err) => setGpsMsg(err.code === 1 ? "위치 권한이 거부됐어요. 브라우저 설정에서 허용해주세요" : "위치를 가져오지 못했어요"),
-      { enableHighAccuracy: true, timeout: 15000 },
+      (err) => {
+        if (err.code === 1) setGpsMsg("위치 권한이 꺼져 있어요. 아이폰: 설정 → 개인정보 보호 및 보안 → 위치 서비스 → Safari 웹사이트 → '앱을 사용하는 동안'. 바꾼 뒤 다시 눌러주세요");
+        else if (err.code === 2) setGpsMsg("위치를 못 찾았어요. 창가나 밖에서 다시 눌러주세요");
+        else setGpsMsg("위치 확인이 오래 걸려요. 다시 한 번 눌러주세요");
+      },
+      { enableHighAccuracy: false, timeout: 25000, maximumAge: 60000 },
     );
   };
 
