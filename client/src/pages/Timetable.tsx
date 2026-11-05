@@ -37,12 +37,7 @@ export function TimetableScreen({
   const weekly = useMemo(() => blocks.filter((b) => !b.date), [blocks]);
   const startH = Math.min(9, ...weekly.map((b) => Math.floor(toMin(b.start) / 60)));
   const endH = Math.max(18, ...weekly.map((b) => Math.ceil(toMin(b.end) / 60)));
-  const days = useMemo(() => {
-    const d = [1, 2, 3, 4, 5];
-    if (weekly.some((b) => b.day === 6)) d.push(6);
-    if (weekly.some((b) => b.day === 0)) d.push(0);
-    return d;
-  }, [weekly]);
+  const days = [1, 2, 3, 4, 5, 6, 0]; // 월~일 항상 표시 (직장인·주말 일정도 쓸 수 있게)
   const hours = Array.from({ length: endH - startH }, (_, i) => startH + i);
   const gridH = hours.length * HOUR_H;
 
