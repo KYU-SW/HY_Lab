@@ -520,7 +520,7 @@ function HomeScreen({
       <div className="app-header"><div><span className="date-label">{new Date().toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "long" })}</span><h2>좋은 하루예요, {user.nickname}님 <span>✦</span></h2></div><button className="avatar-button">{user.nickname.slice(0, 1)}</button></div>
       <ScoreCard score={score} goal={goal} />
       <section className={`gauge-card ${trackingOn ? "" : "is-paused"}`}>
-        <div className="gauge-card-top"><span className="section-kicker">CURRENT RHYTHM</span><button className="more-icon"><MoreHorizontal size={18} /></button></div>
+        <div className="gauge-card-top"><span className="section-kicker">CURRENT RHYTHM</span></div>
         <div className="gauge-area">
           <div className="gauge-arc"><div className="gauge-arc-inner" /><div className="gauge-needle" style={{ transform: `rotate(${needleRotate}deg)` }} /></div>
           <div className="gauge-center"><span>연속 좌식 시간</span><strong>{formatClock(continuousSeconds)}</strong><small><i className={`zone-dot zone-dot--${trackingOn ? zone.level : "off"}`} /> {trackingOn ? zone.label : "기록 꺼짐"}</small></div>
