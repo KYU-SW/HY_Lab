@@ -323,3 +323,71 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(34, 197, 94,
 .action-chips{display:flex;gap:8px;margin:0 20px 12px}
 .action-chips button{flex:1;padding:9px 0;border-radius:99px;border:1px solid rgba(0,0,0,.12);background:transparent;font-size:13px}
 .action-chips button.is-on{background:#3fbf8a;color:#fff;border-color:#3fbf8a}
+
+/* ---------- 건강 점수 카드 (최종안 v2) ---------- */
+.score-card { margin-top: 16px; padding: 14px 15px 12px; border: 1px solid #e3ece6; border-radius: 18px; background: #fff; box-shadow: 0 8px 22px rgba(19,148,71,.06); cursor: pointer; }
+.score-card-top { display: flex; justify-content: space-between; align-items: flex-start; }
+.score-total { display: flex; align-items: baseline; gap: 4px; margin-top: 3px; }
+.score-total strong { color: var(--ink); font-size: 30px; font-weight: 800; letter-spacing: -.04em; line-height: 1; }
+.score-total span { color: var(--muted); font-size: 11px; font-weight: 600; }
+.grade-chip { padding: 5px 10px; border-radius: 99px; font-size: 10px; font-weight: 800; letter-spacing: -.02em; }
+.grade-chip--g1 { background: #c9f0da; color: #0b6b33; }
+.grade-chip--g2 { background: #e5f6c8; color: #3f6b0b; }
+.grade-chip--g3 { background: #ffefc6; color: #8a5a00; }
+.grade-chip--g4 { background: #fde1df; color: #a1261b; }
+.score-parts { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 14px; margin-top: 13px; }
+.score-part-head { display: flex; justify-content: space-between; align-items: baseline; color: var(--ink-soft); font-size: 9.5px; font-weight: 600; }
+.score-part-head b { color: var(--ink); font-size: 11px; }
+.score-part-head b small { color: var(--muted); font-size: 8.5px; font-weight: 600; }
+.score-bar { height: 5px; margin-top: 4px; border-radius: 99px; background: #edf2ee; overflow: hidden; }
+.score-bar i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, #7fd8b0, var(--green)); transition: width .5s var(--ease-out); }
+.score-extra { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.score-extra span { padding: 3px 8px; border-radius: 99px; background: var(--green-tint); color: var(--green-deep); font-size: 9px; font-weight: 700; }
+.score-goal { margin-top: 10px; padding-top: 9px; border-top: 1px dashed #e3ece6; color: var(--ink-soft); font-size: 9.5px; }
+.score-goal b { color: var(--green-deep); font-size: 11px; }
+.score-goal small { color: var(--muted); font-size: 8.5px; }
+.score-note { display: flex; align-items: center; gap: 4px; margin: 8px 0 0; color: #a07a1a; font-size: 9px; }
+.score-detail { margin-top: 9px; padding: 9px 10px; border-radius: 10px; background: #f6faf7; color: var(--ink-soft); font-size: 9px; line-height: 1.6; }
+.score-detail p { margin: 0 0 3px; }
+.score-detail-src { color: var(--muted); }
+
+/* ---------- 운동 고르기 (타이머) ---------- */
+.gain-head em { margin-left: 4px; color: var(--green-deep); font-style: normal; font-size: 12px; }
+.exercise-picker { margin: 0 20px 12px; display: flex; flex-direction: column; gap: 9px; }
+.exercise-group-label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 9.5px; font-weight: 700; letter-spacing: .02em; }
+.action-chips--wrap { flex-wrap: wrap; margin: 0; gap: 6px; }
+.action-chips--wrap button { flex: 0 0 auto; padding: 7px 11px; font-size: 11px; }
+.timer-actions .primary-button:disabled { opacity: .45; }
+
+/* ---------- 내 몸 정보 ---------- */
+.body-purpose { margin: 0 0 9px; color: var(--ink-soft); font-size: 9px; line-height: 1.6; }
+.body-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.body-grid label { display: flex; flex-direction: column; gap: 4px; color: var(--ink-soft); font-size: 9px; font-weight: 600; }
+.body-grid-wide { grid-column: 1 / -1; }
+.body-grid input, .body-grid select { padding: 7px 8px; border: 1px solid #dfe8e2; border-radius: 8px; background: #fff; color: var(--ink); font-size: 11px; }
+.body-preview { margin: 9px 0 0; color: var(--ink-soft); font-size: 9px; }
+.body-preview b { color: var(--green-deep); }
+.body-actions { display: flex; gap: 6px; margin-top: 9px; }
+.panel-delete { padding: 8px 8px; border-radius: 7px; color: #a1261b; background: #fdecea; font-size: 8px; font-weight: 800; white-space: nowrap; }
+.grade-chip--wait { background: #eef2ef; color: var(--muted); }
+.body-panel { margin-left: 0; }
+.body-grid input, .body-grid select { width: 100%; min-width: 0; box-sizing: border-box; }
+.body-grid label { min-width: 0; }
+
+/* ---------- 가입 직후 몸 정보 (선택) ---------- */
+.bodyinfo-screen { padding-bottom: 28px; }
+.bodyinfo-top { display: flex; justify-content: space-between; align-items: center; padding-top: 20px; }
+.bodyinfo-skip { color: var(--muted); font-size: 11px; font-weight: 700; padding: 6px 2px; }
+.bodyinfo-intro { margin-top: 26px; }
+.bodyinfo-intro h2 { margin: 6px 0 0; color: var(--ink); font-size: 22px; line-height: 1.35; letter-spacing: -.05em; }
+.bodyinfo-intro p { margin: 10px 0 0; color: var(--ink-soft); font-size: 11px; line-height: 1.7; }
+.bodyinfo-card { margin-top: 18px; padding: 14px; border: 1px solid #e3ece6; border-radius: 16px; background: #fff; box-shadow: 0 8px 22px rgba(19,148,71,.06); }
+.bodyinfo-card .body-grid input, .bodyinfo-card .body-grid select { font-size: 13px; padding: 9px 10px; }
+.bodyinfo-card .body-grid label { font-size: 10px; }
+.bodyinfo-card .body-purpose, .bodyinfo-card .body-preview { font-size: 10px; }
+.bodyinfo-card .body-actions { margin-top: 12px; }
+.bodyinfo-card .panel-save { flex: 1; padding: 12px; border-radius: 12px; font-size: 12px; }
+.bodyinfo-levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 12px; }
+.bodyinfo-levels div { padding: 8px; border-radius: 10px; background: #f3f8f4; display: flex; flex-direction: column; gap: 2px; }
+.bodyinfo-levels b { color: var(--green-deep); font-size: 10px; }
+.bodyinfo-levels span { color: var(--ink-soft); font-size: 8.5px; line-height: 1.4; }

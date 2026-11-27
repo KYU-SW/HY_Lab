@@ -1,3 +1,5 @@
+import type { Accuracy, BodyProfile, MoveRecord, RecoveryRecord, ScoreBreakdown } from "@shared/scoring";
+
 export type SessionUser = {
   id: string;
   nickname: string;
@@ -5,7 +7,16 @@ export type SessionUser = {
   breakIntervalMin: number;
   scheduleQuietEnabled: boolean;
   trackingEnabled?: boolean;
+  profile?: BodyProfile;
   createdAt: string;
+};
+
+export type DailyGoal = {
+  measuring: boolean;
+  daysCollected: number;
+  baseline?: number;
+  goal: number | null;
+  todayCredited: number;
 };
 
 export type RiskZone = { level: "safe" | "notice" | "risk"; label: string };
@@ -14,7 +25,12 @@ export type Dashboard = {
   continuousSeconds: number;
   todaySeconds: number;
   todayMovementCount: number;
-  todayBonusPoints: number;
+  todayMoves: MoveRecord[];
+  todayRecoveries: RecoveryRecord[];
+  score: ScoreBreakdown;
+  goal: DailyGoal;
+  profile: BodyProfile;
+  accuracy: Accuracy;
   breakIntervalMin: number;
   risk: RiskZone;
   quiet: boolean;
@@ -28,8 +44,8 @@ export type CalendarDay = {
   movementCount: number;
   maxContinuousSeconds: number;
   edema: EdemaLevel | null;
-  bonusPoints: number;
   score: number;
+  breakdown: ScoreBreakdown;
   prev7Avg: number | null;
 };
 
@@ -89,7 +105,7 @@ export const api = {
 
   getUser: (id: string) => request<{ user: SessionUser }>(`/api/users/${id}`),
 
-  updateUser: (id: string, patch: Partial<Pick<SessionUser, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled">>) =>
+  updateUser: (id: string, patch: Partial<Pick<SessionUser, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled">> & { profile?: BodyProfile | null }) =>
     request<{ user: SessionUser }>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
   getDashboard: (id: string) => request<Dashboard>(`/api/dashboard/${id}`),
@@ -100,10 +116,10 @@ export const api = {
       body: JSON.stringify({ user_id: userId, seconds }),
     }),
 
-  logMovement: (userId: string, bonusPoints = 0) =>
-    request<{ todayMovementCount: number; todayBonusPoints: number; continuousSeconds: number }>("/api/movements", {
+  logMovement: (userId: string, exerciseId: string, durationSec: number, asRecovery = false) =>
+    request<{ todayMovementCount: number; todayMoves: MoveRecord[]; todayRecoveries: RecoveryRecord[]; score: ScoreBreakdown; goal: DailyGoal; continuousSeconds: number }>("/api/movements", {
       method: "POST",
-      body: JSON.stringify({ user_id: userId, bonusPoints }),
+      body: JSON.stringify({ user_id: userId, exerciseId, durationSec, asRecovery }),
     }),
 
   getCalendar: (id: string, month: string) =>

@@ -18,6 +18,8 @@ import {
   findUserByEmail,
   getLastMovedAt,
   getMonthLog,
+  getDailyGoal,
+  scoreOfDay,
   getTodayLog,
   getUser,
   getWeeklyLog,
@@ -33,6 +35,33 @@ import {
 } from "./db";
 import { fetchIcsFromUrl, parseIcs } from "./ics";
 import { getPublicKey } from "./push";
+import { EXERCISE_BY_ID, metCorrection, type BodyProfile } from "../shared/scoring";
+
+// 몸 정보 검증: 범위를 벗어나거나 비운 값은 저장하지 않음 (모두 선택 입력)
+function cleanProfile(raw: unknown): BodyProfile | null {
+  if (raw === null) return {};
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const num = (v: unknown, min: number, max: number) => {
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+    return Number.isFinite(n) && n >= min && n <= max ? Math.round(n * 10) / 10 : undefined;
+  };
+  const p: BodyProfile = {};
+  const given = (v: unknown) => v !== undefined && v !== null && v !== "";
+  if (given(r.sex) && r.sex !== "male" && r.sex !== "female") return null;
+  if (r.sex === "male" || r.sex === "female") p.sex = r.sex;
+  const by = num(r.birthYear, 1900, new Date().getFullYear());
+  if (by) p.birthYear = Math.round(by);
+  const h = num(r.heightCm, 100, 250);
+  if (h) p.heightCm = h;
+  const w = num(r.weightKg, 25, 300);
+  if (w) p.weightKg = w;
+  const bf = num(r.bodyFatPct, 3, 70);
+  if (bf) p.bodyFatPct = bf;
+  // 값을 넣었는데 범위를 벗어난 항목이 있으면 저장하지 않고 거부 (기존 정보를 지우지 않도록)
+  if ((given(r.birthYear) && !p.birthYear) || (given(r.heightCm) && !p.heightCm) || (given(r.weightKg) && !p.weightKg) || (given(r.bodyFatPct) && !p.bodyFatPct)) return null;
+  return p;
+}
 
 // 연속 좌식 구간: 안전 ~30분 / 주의 30~60분 / 위험 60분 이상
 function riskZone(elapsedSeconds: number) {
@@ -118,7 +147,7 @@ export function registerApiRoutes(app: Express) {
   app.patch("/api/users/:id", (req, res) => {
     const id = requireUser(req, res);
     if (!id) return;
-    const { nickname, breakIntervalMin, scheduleQuietEnabled, trackingEnabled } = req.body ?? {};
+    const { nickname, breakIntervalMin, scheduleQuietEnabled, trackingEnabled, profile } = req.body ?? {};
     const patch: Record<string, unknown> = {};
     if (typeof nickname === "string") {
       const trimmed = nickname.trim();
@@ -128,6 +157,11 @@ export function registerApiRoutes(app: Express) {
     if (typeof breakIntervalMin === "number") patch.breakIntervalMin = breakIntervalMin;
     if (typeof scheduleQuietEnabled === "boolean") patch.scheduleQuietEnabled = scheduleQuietEnabled;
     if (typeof trackingEnabled === "boolean") patch.trackingEnabled = trackingEnabled;
+    if (profile !== undefined) {
+      const cleaned = cleanProfile(profile);
+      if (!cleaned) return res.status(400).json({ error: "범위를 벗어난 값이 있어요. 출생연도·키(100~250cm)·몸무게(25~300kg)·체지방률(3~70%)을 확인해주세요." });
+      patch.profile = cleaned;
+    }
     const user = updateUser(id, patch);
     res.json({ user: publicUser(user!) });
   });
@@ -147,7 +181,12 @@ export function registerApiRoutes(app: Express) {
       continuousSeconds: elapsedSeconds,
       todaySeconds: today.totalSeconds,
       todayMovementCount: today.movementCount,
-      todayBonusPoints: today.bonusPoints ?? 0,
+      todayMoves: today.moves ?? [],
+      todayRecoveries: today.recoveries ?? [],
+      score: scoreOfDay(today, user.profile),
+      goal: getDailyGoal(id),
+      profile: user.profile ?? {},
+      accuracy: metCorrection(user.profile).accuracy,
       breakIntervalMin: user.breakIntervalMin,
       risk: zone,
       quiet: isQuietNow(id),
@@ -168,9 +207,20 @@ export function registerApiRoutes(app: Express) {
   app.post("/api/movements", (req, res) => {
     const id = requireUser(req, res);
     if (!id) return;
-    markMoved(id, Number(req.body?.bonusPoints) || 0);
-    const today = getTodayLog(id);
-    res.json({ todayMovementCount: today.movementCount, todayBonusPoints: today.bonusPoints ?? 0, continuousSeconds: 0 });
+    const exerciseId = String(req.body?.exerciseId ?? "");
+    if (!EXERCISE_BY_ID[exerciseId]) return res.status(400).json({ error: "알 수 없는 운동이에요." });
+    const durationSec = Number(req.body?.durationSec) || 0;
+    const asRecovery = req.body?.asRecovery === true;
+    const dayLog = markMoved(id, exerciseId, durationSec, asRecovery)!;
+    const user = getUser(id)!;
+    res.json({
+      todayMovementCount: dayLog.movementCount,
+      todayMoves: dayLog.moves ?? [],
+      todayRecoveries: dayLog.recoveries ?? [],
+      score: scoreOfDay(dayLog, user.profile),
+      goal: getDailyGoal(id),
+      continuousSeconds: 0,
+    });
   });
 
   app.get("/api/weekly/:id", (req, res) => {

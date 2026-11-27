@@ -1,6 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
+  EXERCISES,
+  EXERCISE_BY_ID,
+  RECOMMENDED_SEC,
+  CATEGORY_LABEL,
+  BAND_LABEL,
+  MAX_COUNTED_SEC,
+  bandOf,
+  kcalOf,
+  metCorrection,
+  scoreDay,
+  type BodyProfile,
+  type ExerciseCategory,
+  type MoveRecord,
+  type RecoveryRecord,
+  type ScoreBreakdown,
+} from "@shared/scoring";
+import {
   ArrowLeft,
   ArrowRight,
   BarChart3,
@@ -36,7 +53,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, ApiError, type CalendarDay, type Dashboard, type EdemaLevel, type PeriodStat, type ReminderTime, type ScheduleBlock, type SessionUser } from "@/lib/api";
+import { api, ApiError, type CalendarDay, type DailyGoal, type Dashboard, type EdemaLevel, type PeriodStat, type ReminderTime, type ScheduleBlock, type SessionUser } from "@/lib/api";
 import { clearSession, loadSession, saveSession } from "@/lib/session";
 import { TimetableScreen, type ClassDraft } from "@/pages/Timetable";
 import { GpsClassifier, MOTION, StepDetector, type MotionState } from "@/lib/motion";
@@ -50,9 +67,10 @@ type Screen =
   | "stats"
   | "settings"
   | "timetable"
+  | "bodyinfo"
   | "timer";
 type AuthMode = "login" | "signup";
-type MoveMode = "seated" | "standing";
+type MoveMode = "seated" | "standing" | "recovery";
 type RiskLevel = "safe" | "notice" | "risk";
 
 type NavItem = {
@@ -72,17 +90,11 @@ const navItems: NavItem[] = [
 const WEEKDAY_LABEL = ["일", "월", "화", "수", "목", "금", "토"];
 const BREAK_INTERVAL_OPTIONS = [20, 30, 45, 60];
 
-// ---- 움직임 점수 규칙 (여기 상수만 바꾸면 됨) ----
-const DAILY_MOVEMENT_TARGET = 8; // 하루 움직임 8회 = 달성도 100%
-const BONUS_BASE = 5; // 타이머를 권장 시간 이상 채우고 종료하면 +5%
-const BONUS_STEP = 1; // 이후 BONUS_STEP_SEC마다 +1%
-const BONUS_STEP_SEC = 10;
-const BONUS_MAX = 10; // 한 번에 받을 수 있는 최대 보너스 +10%
+// ---- 점수 규칙은 shared/scoring.ts (최종안 v2) ----
 const ZONE_NOTICE_MIN = 30; // 안전 ~30분 / 주의 30~60분 / 위험 60분 이상
 const ZONE_RISK_MIN = 60;
-const scoreOf = (count: number, bonus: number) => Math.min(100, Math.round((count / DAILY_MOVEMENT_TARGET) * 100) + bonus);
-const bonusFor = (elapsedSec: number, requiredSec: number) =>
-  elapsedSec < requiredSec ? 0 : Math.min(BONUS_MAX, BONUS_BASE + Math.floor((elapsedSec - requiredSec) / BONUS_STEP_SEC) * BONUS_STEP);
+const EMPTY_SCORE: ScoreBreakdown = scoreDay({ sitSeconds: 0, moves: [] });
+const GRADE_CLASS: Record<string, string> = { "아주 좋음": "g1", 좋음: "g2", 주의: "g3", 위험: "g4" };
 
 // ---- GPS 자동 감지 규칙 (판별 기준은 lib/motion.ts) ----
 const GPS_STILL_HOLD_SEC = 120; // 걷기가 이 시간 동안 없으면 "앉아 계신가요?" 질문
@@ -109,32 +121,29 @@ const onboardingSlides = [
   },
 ];
 
-const movementCards = {
+const movementCards: Record<MoveMode, { title: string; copy: string; categories: ExerciseCategory[]; icon: LucideIcon; accent: string }> = {
   seated: {
     title: "앉아서 가볍게",
     copy: "자리에서 바로 할 수 있는\n다리 혈액순환 동작이에요.",
-    duration: "1분",
-    actions: [
-      { action: "발목 펌프", detail: "발뒤꿈치는 바닥에 두고, 발끝을 최대한 들었다가 천천히 내려주세요." },
-      { action: "종아리 들기", detail: "앉은 채로 발끝은 바닥에 두고, 발뒤꿈치를 천천히 들었다 내려주세요. 종아리가 일하는 느낌이면 충분해요." },
-    ],
+    categories: ["seated"],
     icon: Footprints,
     accent: "mint",
-    seconds: 60,
   },
   standing: {
     title: "잠깐 일어나기",
-    copy: "물 한 잔을 가지러 가거나\n짧게 몸을 깨워보세요.",
-    duration: "3분",
-    actions: [
-      { action: "가볍게 걷기", detail: "숨이 약간 차오르지 않는 편한 속도로 걸어보세요. 복도나 사무실 안이면 충분해요." },
-      { action: "물 마시러 가기", detail: "자리에서 일어나 물을 한 잔 받아오며 몸에 작은 전환을 만들어보세요." },
-    ],
+    copy: "걷기·제자리 근력·계단 중에서\n지금 할 수 있는 걸 골라요.",
+    categories: ["walk", "strength", "vigorous"],
     icon: MoveUpRight,
     accent: "lime",
-    seconds: 180,
   },
-} as const;
+  recovery: {
+    title: "회복 활동",
+    copy: "숨이 조금 차는 활동을 길게 하면\n오늘 깎인 점수를 되찾아요.",
+    categories: ["recovery", "vigorous"],
+    icon: HeartPulse,
+    accent: "lime",
+  },
+};
 
 function formatClock(totalSeconds: number) {
   const s = Math.max(0, Math.round(totalSeconds));
@@ -217,7 +226,7 @@ function PrototypeRail({ screen, onNavigate }: { screen: Screen; onNavigate: (ne
         <button className={`flow-item ${screen === "onboarding" ? "is-active" : ""}`} onClick={() => onNavigate("onboarding")}>
           <span className="flow-index">02</span><span>온보딩</span><ArrowRight size={14} />
         </button>
-        <button className={`flow-item ${screen === "auth" ? "is-active" : ""}`} onClick={() => onNavigate("auth")}>
+        <button className={`flow-item ${screen === "auth" || screen === "bodyinfo" ? "is-active" : ""}`} onClick={() => onNavigate("auth")}>
           <span className="flow-index">03</span><span>로그인 / 가입</span><ArrowRight size={14} />
         </button>
         <button className={`flow-item ${["home", "calendar", "stats", "settings", "timetable"].includes(screen) ? "is-active" : ""}`} onClick={() => onNavigate("home")}>
@@ -282,6 +291,7 @@ function screenLabel(screen: Screen) {
     settings: "설정",
     timetable: "일정",
     timer: "움직임 타이머",
+    bodyinfo: "내 몸 정보",
   };
   return labels[screen];
 }
@@ -443,12 +453,45 @@ function AuthScreen({
 
 function EyeIcon() { return <span className="eye-icon">◉</span>; }
 
+const SCORE_PARTS: { key: "a1" | "a2" | "b" | "c"; label: string; max: number; hint: string }[] = [
+  { key: "a1", label: "다리 혈관", max: 25, hint: "30분 안에 끊기" },
+  { key: "a2", label: "혈당", max: 25, hint: "일어나서 끊기" },
+  { key: "b", label: "움직인 양", max: 30, hint: "일어나서 움직인 시간" },
+  { key: "c", label: "앉은 시간", max: 20, hint: "7시간 이하면 만점" },
+];
+
+function ScoreCard({ score, goal, compact = false }: { score: ScoreBreakdown; goal?: DailyGoal | null; compact?: boolean }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section className={`score-card ${compact ? "score-card--compact" : ""}`} onClick={() => setOpen((v) => !v)}>
+      <div className="score-card-top">
+        <div><span className="section-kicker">TODAY SCORE</span><div className="score-total"><strong>{score.total}</strong><span>/ 100</span></div></div>
+        {score.enoughData ? <span className={`grade-chip grade-chip--${GRADE_CLASS[score.grade]}`}>{score.grade}</span> : <span className="grade-chip grade-chip--wait">측정 중</span>}
+      </div>
+      <div className="score-parts">
+        {SCORE_PARTS.map((p) => (
+          <div key={p.key} className="score-part"><div className="score-part-head"><span>{p.label}</span><b>{score[p.key]}<small>/{p.max}</small></b></div><div className="score-bar"><i style={{ width: `${(score[p.key] / p.max) * 100}%` }} /></div></div>
+        ))}
+      </div>
+      {(score.d > 0 || score.bonus > 0) && <div className="score-extra">{score.d > 0 && <span>회복 +{score.d}</span>}{score.bonus > 0 && <span>계단·숨찬 활동 보너스 +{score.bonus}</span>}</div>}
+      {goal && <div className="score-goal">{goal.measuring ? <span>나의 목표: 기준선 측정 중 ({goal.daysCollected}/3일)</span> : <span>나의 목표: 30분 안에 끊기 <b>{Math.floor(goal.todayCredited)}</b> / {goal.goal}번 <small>(지난 기록 평균 {goal.baseline}번 + 15%)</small></span>}</div>}
+      {!score.enoughData && <p className="score-note"><Info size={12} /> 앉은 기록이 1시간 미만이라 등급은 아직 측정 중이에요.</p>}
+      {open && <div className="score-detail">
+        <p>오늘 목표 끊기 {score.targetBreaks}번 (앉은 시간을 30분으로 나눈 값) · 혈관 인정 {score.credited1}번 · 혈당 인정 {score.credited2}번</p>
+        <p>일어나서 움직인 시간 {score.activeMin}분 · 회복 활동 {score.recoveryMin}분 · 강도 계산 정확도 {score.accuracy}</p>
+        <p className="score-detail-src">30분 안에 끊으면 1회, 30~60분 0.6회(혈당 0.3회), 60분 넘으면 0.25회(혈당 0회)로 인정해요. 앉아서 하는 동작은 다리 혈관 점수만 받아요.</p>
+      </div>}
+    </section>
+  );
+}
+
 function HomeScreen({
   user,
   continuousSeconds,
   todaySeconds,
   movementCount,
   score,
+  goal,
   zone,
   trackingOn,
   autoPaused,
@@ -460,7 +503,8 @@ function HomeScreen({
   continuousSeconds: number;
   todaySeconds: number;
   movementCount: number;
-  score: number;
+  score: ScoreBreakdown;
+  goal: DailyGoal | null;
   zone: { level: RiskLevel; label: string };
   trackingOn: boolean;
   autoPaused: boolean;
@@ -474,7 +518,7 @@ function HomeScreen({
     <div className="screen app-screen home-screen">
       <StatusBar />
       <div className="app-header"><div><span className="date-label">{new Date().toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "long" })}</span><h2>좋은 하루예요, {user.nickname}님 <span>✦</span></h2></div><button className="avatar-button">{user.nickname.slice(0, 1)}</button></div>
-      <div className="daily-note"><div className="note-icon"><Sparkles size={16} /></div><div><strong>오늘도 가볍게 이어가요</strong><span>오늘 {movementCount}번 움직였어요 · 움직임 점수 {score}%</span></div><ChevronRight size={17} /></div>
+      <ScoreCard score={score} goal={goal} />
       <section className={`gauge-card ${trackingOn ? "" : "is-paused"}`}>
         <div className="gauge-card-top"><span className="section-kicker">CURRENT RHYTHM</span><button className="more-icon"><MoreHorizontal size={18} /></button></div>
         <div className="gauge-area">
@@ -499,23 +543,78 @@ function BottomNav({ current, onNavigate }: { current: NavItem["id"]; onNavigate
 }
 
 function MoveSheet({ onClose, onSelect }: { onClose: () => void; onSelect: (mode: MoveMode) => void }) {
-  return <div className="sheet-backdrop" onClick={onClose}><div className="move-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-heading"><div><span className="section-kicker">ONE SMALL SHIFT</span><h2>지금, 어떤 게 가능해요?</h2><p>지금의 상황에 맞는 움직임을 골라주세요.</p></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="move-options"><button onClick={() => onSelect("seated")}><span className="move-option-icon move-option-icon--mint"><Footprints size={22} /></span><span><strong>지금 못 일어나요</strong><small>앉은 채로 1분, 다리 깨우기</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("standing")}><span className="move-option-icon move-option-icon--lime"><MoveUpRight size={22} /></span><span><strong>일어날 수 있어요</strong><small>물 한 잔, 3분 걷기로 리셋하기</small></span><ChevronRight size={18} /></button></div><p className="sheet-footnote"><ShieldCheck size={14} /> 무리하지 않고 지금 가능한 만큼만 해요.</p></div></div>;
+  return <div className="sheet-backdrop" onClick={onClose}><div className="move-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-heading"><div><span className="section-kicker">ONE SMALL SHIFT</span><h2>지금, 어떤 게 가능해요?</h2><p>지금의 상황에 맞는 움직임을 골라주세요.</p></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="move-options"><button onClick={() => onSelect("seated")}><span className="move-option-icon move-option-icon--mint"><Footprints size={22} /></span><span><strong>지금 못 일어나요</strong><small>앉은 채로 1분, 다리 깨우기 (다리 혈관 점수)</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("standing")}><span className="move-option-icon move-option-icon--lime"><MoveUpRight size={22} /></span><span><strong>일어날 수 있어요</strong><small>걷기 · 제자리 근력 · 계단 (혈관+혈당 점수)</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("recovery")}><span className="move-option-icon move-option-icon--lime"><HeartPulse size={22} /></span><span><strong>운동·회복 활동</strong><small>조깅·자전거·빠르게 걷기를 길게 (깎인 점수 회복)</small></span><ChevronRight size={18} /></button></div><p className="sheet-footnote"><ShieldCheck size={14} /> 무리하지 않고 지금 가능한 만큼만 해요.</p></div></div>;
 }
 
-function TimerScreen({ mode, onComplete, onBack, baseScore, nextScoreOf }: { mode: MoveMode; onComplete: (bonusPoints: number) => void; onBack: () => void; baseScore: number; nextScoreOf: (bonus: number) => number }) {
+function TimerScreen({
+  mode,
+  todaySeconds,
+  continuousSeconds,
+  moves,
+  recoveries,
+  profile,
+  onComplete,
+  onBack,
+}: {
+  mode: MoveMode;
+  todaySeconds: number;
+  continuousSeconds: number;
+  moves: MoveRecord[];
+  recoveries: RecoveryRecord[];
+  profile: BodyProfile;
+  onComplete: (exerciseId: string, durationSec: number, asRecovery: boolean) => void;
+  onBack: () => void;
+}) {
   const movement = movementCards[mode];
-  const required = movement.seconds;
-  const [actionIdx, setActionIdx] = useState(0);
-  const current = movement.actions[actionIdx];
+  const options = useMemo(() => EXERCISES.filter((e) => movement.categories.includes(e.category)), [movement]);
+  const [exerciseId, setExerciseId] = useState(options[0]?.id ?? "walk_easy");
+  const ex = EXERCISE_BY_ID[exerciseId];
+  const isRecovery = mode === "recovery";
+  const required = isRecovery ? RECOMMENDED_SEC.recovery : RECOMMENDED_SEC[ex.category];
   const [elapsed, setElapsed] = useState(0);
+  const [priorSit] = useState(continuousSeconds); // 이 동작 직전 연속 좌식 시간
   useEffect(() => { const timer = window.setInterval(() => setElapsed((value) => value + 1), 1000); return () => window.clearInterval(timer); }, []);
   const done = elapsed >= required;
-  const bonus = bonusFor(elapsed, required);
   const progress = Math.min(1, elapsed / required);
   const shown = done ? elapsed - required : required - elapsed;
-  const fmt = `${String(Math.floor(shown / 60)).padStart(2, "0")}:${String(shown % 60).padStart(2, "0")}`;
+  const mm = Math.floor(shown / 60);
+  const fmt = `${String(mm).padStart(2, "0")}:${String(shown % 60).padStart(2, "0")}`;
   const Icon = movement.icon;
-  return <div className="screen app-screen timer-screen"><StatusBar /><div className="timer-header"><button className="icon-button" onClick={onBack}><ArrowLeft size={19} /></button><span>움직임 타이머</span><button className="icon-button"><CircleHelp size={18} /></button></div><div className="timer-intro"><span className="section-kicker">RIGHT NOW</span><h2>{movement.title}</h2><p>{movement.copy.split("\n").map((line) => <span key={line}>{line}</span>)}</p></div><div className={`timer-circle timer-circle--${movement.accent}`} style={{ "--progress": `${progress * 360}deg` } as React.CSSProperties}><div className="timer-circle-inner"><span>{done ? "권장 시간 달성 · 추가 운동 +" : "권장 시간까지"}</span><strong>{fmt}</strong><small><i /> {done ? `보너스 +${bonus}%` : "천천히 따라 해보세요"}</small></div></div><div className="gain-card"><div className="gain-head"><span>오늘 성취</span><strong>{baseScore}% → {nextScoreOf(bonus)}%</strong></div><div className="gain-bar"><i style={{ width: `${(bonus / BONUS_MAX) * 100}%` }} /></div><small>{!done ? `권장 시간을 채우면 +${BONUS_BASE}%부터 시작해요` : bonus >= BONUS_MAX ? `이번 운동 보너스 최대 +${BONUS_MAX}% 달성!` : `이번 운동 보너스 +${bonus}% / 최대 +${BONUS_MAX}%`}</small></div><div className="movement-detail-card"><div className={`movement-detail-icon movement-detail-icon--${movement.accent}`}><Icon size={23} /></div><div><span>오늘의 움직임 · 권장 {movement.duration}</span><strong>{current.action}</strong><p>{current.detail}</p></div></div><div className="action-chips">{movement.actions.map((a, i) => <button key={a.action} className={i === actionIdx ? "is-on" : ""} onClick={() => setActionIdx(i)}>{a.action}</button>)}</div><div className="timer-actions"><button className="secondary-button" onClick={onBack}><RotateCcw size={16} /> 다시 고르기</button><button className="primary-button" onClick={() => onComplete(bonus)}><Check size={17} /> 완료했어요</button></div><p className="medical-note"><Info size={13} /> 권장 시간을 채우면 +{BONUS_BASE}%, 이후 {BONUS_STEP_SEC}초마다 +{BONUS_STEP}% (최대 +{BONUS_MAX}%). 통증이 있다면 멈추고 전문가와 상담하세요.</p></div>;
+  const { factor, accuracy } = metCorrection(profile);
+  const met = Math.round(ex.met * factor * 10) / 10;
+  const band = bandOf(met);
+  const kcal = kcalOf(exerciseId, elapsed, profile);
+
+  const before = useMemo(() => scoreDay({ sitSeconds: todaySeconds, moves, recoveries, profile }), [todaySeconds, moves, recoveries, profile]);
+  const after = scoreDay({
+    sitSeconds: todaySeconds,
+    moves: isRecovery ? moves : [...moves, { at: "", exerciseId, durationSec: elapsed, priorSitSec: priorSit }],
+    recoveries: isRecovery ? [...recoveries, { at: "", exerciseId, durationSec: elapsed }] : recoveries,
+    profile,
+  });
+  const gain = Math.round((after.total - before.total) * 10) / 10;
+  const capped = !isRecovery && elapsed >= MAX_COUNTED_SEC;
+  const groups = movement.categories.map((c) => ({ c, items: options.filter((o) => o.category === c) })).filter((g) => g.items.length);
+  const priorMin = Math.round(priorSit / 60);
+  const recoverable = 20 - before.c + 0.5 * (50 - before.a1 - before.a2);
+  const breakNote = isRecovery
+    ? recoverable < 0.5 ? "지금은 깎인 점수가 없어서 회복할 게 없어요. 많이 앉은 날 해두면 점수를 되찾아요."
+      : met < 3 ? "이 강도로는 회복으로 인정되지 않아요 (중간 강도 이상)."
+      : `회복 가능한 점수 ${Math.round(recoverable * 10) / 10}점 중 60분이면 전부 되찾아요.`
+    : priorMin <= 30 ? `${priorMin}분 앉은 뒤 끊었어요 · 30분 이내라 1회로 인정`
+    : priorMin <= 60 ? `${priorMin}분 앉은 뒤 끊었어요 · 혈관 0.6회, 혈당 0.3회로 인정`
+    : `${priorMin}분 앉은 뒤 끊었어요 · 혈관 0.25회만 인정 (다음엔 30분 안에!)`;
+
+  return <div className="screen app-screen timer-screen"><StatusBar />
+    <div className="timer-header"><button className="icon-button" onClick={onBack}><ArrowLeft size={19} /></button><span>{isRecovery ? "회복 활동 타이머" : "움직임 타이머"}</span><button className="icon-button"><CircleHelp size={18} /></button></div>
+    <div className="timer-intro"><span className="section-kicker">RIGHT NOW</span><h2>{movement.title}</h2><p>{movement.copy.split("\n").map((line) => <span key={line}>{line}</span>)}</p></div>
+    <div className={`timer-circle timer-circle--${movement.accent}`} style={{ "--progress": `${progress * 360}deg` } as React.CSSProperties}><div className="timer-circle-inner"><span>{done ? (isRecovery ? "권장 시간 달성 · 계속하면 더 회복" : "권장 시간 달성 · 추가 운동 +") : "권장 시간까지"}</span><strong>{fmt}</strong><small><i /> {capped ? "한 번에 5분까지 인정돼요" : done ? "계속하면 점수가 더 올라가요" : "천천히 따라 해보세요"}</small></div></div>
+    <div className="gain-card"><div className="gain-head"><span>오늘 점수</span><strong>{before.total} → {after.total} <em>{gain > 0 ? `+${gain}` : ""}</em></strong></div><div className="gain-bar"><i style={{ width: `${Math.min(100, after.total)}%` }} /></div><small>{breakNote}</small></div>
+    <div className="movement-detail-card"><div className={`movement-detail-icon movement-detail-icon--${movement.accent}`}><Icon size={23} /></div><div><span>{CATEGORY_LABEL[ex.category]} · 권장 {Math.round(required / 60)}분 · {ex.category === "seated" ? "다리 혈관 점수" : `${BAND_LABEL[band]} 강도 ${met} MET`}{kcal != null && elapsed > 0 ? ` · 약 ${kcal}kcal` : ""}</span><strong>{ex.name}</strong><p>{ex.desc}</p></div></div>
+    <div className="exercise-picker">{groups.map((g) => <div key={g.c} className="exercise-group"><span className="exercise-group-label">{CATEGORY_LABEL[g.c]}</span><div className="action-chips action-chips--wrap">{g.items.map((o) => <button key={o.id} className={o.id === exerciseId ? "is-on" : ""} onClick={() => setExerciseId(o.id)}>{o.name}</button>)}</div></div>)}</div>
+    <div className="timer-actions"><button className="secondary-button" onClick={onBack}><RotateCcw size={16} /> 다시 고르기</button><button className="primary-button" disabled={elapsed < 10} onClick={() => onComplete(exerciseId, elapsed, isRecovery)}><Check size={17} /> 완료했어요</button></div>
+    <p className="medical-note"><Info size={13} /> 운동 강도는 2024 신체활동 강도 목록(Compendium) 값{accuracy === "기본" ? "" : `을 내 몸 정보로 보정한 추정값(정확도 ${accuracy})`}이에요. 통증이 있다면 멈추고 전문가와 상담하세요.</p>
+  </div>;
 }
 
 function formatDuration(totalSeconds: number) {
@@ -577,10 +676,11 @@ function CalendarScreen({ userId, onNavigate }: { userId: string; onNavigate: (n
   };
   const selectedDay = Number(selectedDate.slice(8, 10));
   const selectedMonthLabel = Number(selectedDate.slice(5, 7));
-  const activity = selected ? (selected.score ?? scoreOf(selected.movementCount, selected.bonusPoints ?? 0)) : 0;
-  const delta = selected && selected.prev7Avg != null ? activity - selected.prev7Avg : null;
+  const activity = selected?.score ?? 0;
+  const bd = selected?.breakdown;
+  const delta = selected && selected.prev7Avg != null ? Math.round((activity - selected.prev7Avg) * 10) / 10 : null;
 
-  return <div className="screen app-screen calendar-screen"><StatusBar /><div className="page-header"><div><span className="section-kicker">YOUR RECORD</span><h2>캘린더</h2></div><button className="icon-button" onClick={() => { setYear(Number(todayIso.slice(0, 4))); setMonth(Number(todayIso.slice(5, 7))); setSelectedDate(todayIso); }}><MoreHorizontal size={19} /></button></div><div className="calendar-summary"><div className="calendar-summary-icon"><CalendarDays size={17} /></div><div><strong>이번 달의 리듬</strong><span>{loading ? "불러오는 중..." : `${recordedDays}일 동안 기록했어요`}</span></div><div className="calendar-summary-score">{totalMovements}<span>회</span></div></div><div className="month-switcher"><button onClick={() => moveMonth(-1)}><ChevronLeft size={18} /></button><strong>{year}년 {month}월</strong><button onClick={() => moveMonth(1)} disabled={isCurrentMonth} style={isCurrentMonth ? { opacity: 0.3 } : undefined}><ChevronRight size={18} /></button></div><div className="calendar-weekdays">{WEEKDAY_LABEL.map((day) => <span key={day}>{day}</span>)}</div><div className="calendar-grid">{Array.from({ length: firstWeekday }, (_, i) => <span key={`pad-${i}`} />)}{days.map((day) => { const date = dateOf(day); const rec = records[date]; const ring = rec ? (rec.score ?? 0) : 0; const hasRecord = !!rec && (rec.totalSeconds > 0 || rec.movementCount > 0); return <button key={day} onClick={() => setSelectedDate(date)} disabled={date > todayIso} style={date > todayIso ? { opacity: 0.35 } : undefined} className={`${date === todayIso ? "today" : ""} ${selectedDate === date ? "is-selected" : ""} ${hasRecord ? "has-ring" : ""}`}><span>{day}</span>{hasRecord && <i style={{ "--ring": `${Math.max(ring, 8)}%` } as React.CSSProperties} />}</button>; })}</div><div className="calendar-legend"><span><i className="legend-ring" /> 움직임 점수 (하루 {DAILY_MOVEMENT_TARGET}회 + 보너스)</span><span className="calendar-selected-label">{selectedMonthLabel}월 {selectedDay}일 선택됨</span></div><div className="record-sheet"><div className="record-sheet-heading"><div><span className="section-kicker">{selectedDate}</span><h3>{selectedMonthLabel}월 {selectedDay}일의 기록</h3></div><span className="record-day-score">움직임 점수 {activity}%</span></div>{selected ? <><div className="record-row"><span className="record-row-icon"><Clock3 size={17} /></span><div><strong>총 좌식시간</strong><span>{formatDuration(selected.totalSeconds)}</span></div></div><div className="record-row"><span className="record-row-icon"><Footprints size={17} /></span><div><strong>움직임 실현 횟수</strong><span>{selected.movementCount}회</span></div></div><div className="record-row"><span className="record-row-icon record-row-icon--peach"><HeartPulse size={17} /></span><div><strong>연속 좌식 최대 시간</strong><span>{selected.maxContinuousSeconds > 0 ? formatDuration(selected.maxContinuousSeconds) : "기록 없음"}</span></div></div><div className="record-row"><span className="record-row-icon"><Sparkles size={17} /></span><div><strong>최근 7일 평균 대비</strong><span>{delta === null ? "비교할 기록이 아직 없어요" : `${delta > 0 ? "+" : ""}${delta}%p (평균 ${selected.prev7Avg}%)`}{selected.bonusPoints ? ` · 보너스 +${selected.bonusPoints}%` : ""}</span></div></div></> : <div className="record-row"><span className="record-row-icon"><Info size={17} /></span><div><strong>기록이 없어요</strong><span>{selectedDate === todayIso ? "오늘 사용을 시작하면 여기에 쌓여요" : "이 날은 앱을 사용하지 않았어요"}</span></div></div>}<div className="record-row record-row--signal"><span className="record-row-icon record-row-icon--peach"><Droplets size={17} /></span><div><strong>부종 기록</strong><span>{selected?.edema ? `${selected.edema}` : "그날 다리 붓기를 남겨보세요"}</span></div></div><div className="signal-picker"><div>{(["없음", "약함", "보통", "심함"] as EdemaLevel[]).map((lv) => <button key={lv} className={selected?.edema === lv ? "is-active" : ""} onClick={() => chooseEdema(lv)}>{lv}</button>)}</div></div></div><BottomNav current="calendar" onNavigate={onNavigate} /></div>;
+  return <div className="screen app-screen calendar-screen"><StatusBar /><div className="page-header"><div><span className="section-kicker">YOUR RECORD</span><h2>캘린더</h2></div><button className="icon-button" onClick={() => { setYear(Number(todayIso.slice(0, 4))); setMonth(Number(todayIso.slice(5, 7))); setSelectedDate(todayIso); }}><MoreHorizontal size={19} /></button></div><div className="calendar-summary"><div className="calendar-summary-icon"><CalendarDays size={17} /></div><div><strong>이번 달의 리듬</strong><span>{loading ? "불러오는 중..." : `${recordedDays}일 동안 기록했어요`}</span></div><div className="calendar-summary-score">{totalMovements}<span>회</span></div></div><div className="month-switcher"><button onClick={() => moveMonth(-1)}><ChevronLeft size={18} /></button><strong>{year}년 {month}월</strong><button onClick={() => moveMonth(1)} disabled={isCurrentMonth} style={isCurrentMonth ? { opacity: 0.3 } : undefined}><ChevronRight size={18} /></button></div><div className="calendar-weekdays">{WEEKDAY_LABEL.map((day) => <span key={day}>{day}</span>)}</div><div className="calendar-grid">{Array.from({ length: firstWeekday }, (_, i) => <span key={`pad-${i}`} />)}{days.map((day) => { const date = dateOf(day); const rec = records[date]; const ring = rec ? (rec.score ?? 0) : 0; const hasRecord = !!rec && (rec.totalSeconds > 0 || rec.movementCount > 0); return <button key={day} onClick={() => setSelectedDate(date)} disabled={date > todayIso} style={date > todayIso ? { opacity: 0.35 } : undefined} className={`${date === todayIso ? "today" : ""} ${selectedDate === date ? "is-selected" : ""} ${hasRecord ? "has-ring" : ""}`}><span>{day}</span>{hasRecord && <i style={{ "--ring": `${Math.max(ring, 8)}%` } as React.CSSProperties} />}</button>; })}</div><div className="calendar-legend"><span><i className="legend-ring" /> 건강 점수 (100점)</span><span className="calendar-selected-label">{selectedMonthLabel}월 {selectedDay}일 선택됨</span></div><div className="record-sheet"><div className="record-sheet-heading"><div><span className="section-kicker">{selectedDate}</span><h3>{selectedMonthLabel}월 {selectedDay}일의 기록</h3></div><span className="record-day-score">{activity}점{bd ? ` · ${bd.grade}` : ""}</span></div>{selected ? <><div className="record-row"><span className="record-row-icon"><Clock3 size={17} /></span><div><strong>총 좌식시간</strong><span>{formatDuration(selected.totalSeconds)}</span></div></div><div className="record-row"><span className="record-row-icon"><Footprints size={17} /></span><div><strong>움직임 실현 횟수</strong><span>{selected.movementCount}회</span></div></div><div className="record-row"><span className="record-row-icon record-row-icon--peach"><HeartPulse size={17} /></span><div><strong>연속 좌식 최대 시간</strong><span>{selected.maxContinuousSeconds > 0 ? formatDuration(selected.maxContinuousSeconds) : "기록 없음"}</span></div></div><div className="record-row"><span className="record-row-icon"><Sparkles size={17} /></span><div><strong>최근 7일 평균 대비</strong><span>{delta === null ? "비교할 기록이 아직 없어요" : `${delta > 0 ? "+" : ""}${delta}점 (평균 ${selected.prev7Avg}점)`}</span></div></div>{bd && <div className="record-row"><span className="record-row-icon"><BarChart3 size={17} /></span><div><strong>점수 구성</strong><span>혈관 {bd.a1} · 혈당 {bd.a2} · 움직인 양 {bd.b} · 앉은 시간 {bd.c}{bd.d ? ` · 회복 +${bd.d}` : ""}{bd.bonus ? ` · 보너스 +${bd.bonus}` : ""}</span></div></div>}</> : <div className="record-row"><span className="record-row-icon"><Info size={17} /></span><div><strong>기록이 없어요</strong><span>{selectedDate === todayIso ? "오늘 사용을 시작하면 여기에 쌓여요" : "이 날은 앱을 사용하지 않았어요"}</span></div></div>}<div className="record-row record-row--signal"><span className="record-row-icon record-row-icon--peach"><Droplets size={17} /></span><div><strong>부종 기록</strong><span>{selected?.edema ? `${selected.edema}` : "그날 다리 붓기를 남겨보세요"}</span></div></div><div className="signal-picker"><div>{(["없음", "약함", "보통", "심함"] as EdemaLevel[]).map((lv) => <button key={lv} className={selected?.edema === lv ? "is-active" : ""} onClick={() => chooseEdema(lv)}>{lv}</button>)}</div></div></div><BottomNav current="calendar" onNavigate={onNavigate} /></div>;
 }
 
 function formatMinutes(min: number) {
@@ -638,6 +738,55 @@ function urlBase64ToUint8Array(base64: string) {
   return Uint8Array.from(Array.from(raw, (c) => c.charCodeAt(0)));
 }
 
+const EMPTY_BODY = { sex: "", birthYear: "", heightCm: "", weightKg: "", bodyFatPct: "" };
+
+function BodyForm({ initial, onSave, saveLabel, showDelete = false, onSaved }: { initial: BodyProfile; onSave: (p: BodyProfile | null) => Promise<string | null>; saveLabel: string; showDelete?: boolean; onSaved?: () => void }) {
+  const [body, setBody] = useState<Record<string, string>>(() => ({
+    sex: initial.sex ?? "",
+    birthYear: initial.birthYear ? String(initial.birthYear) : "",
+    heightCm: initial.heightCm ? String(initial.heightCm) : "",
+    weightKg: initial.weightKg ? String(initial.weightKg) : "",
+    bodyFatPct: initial.bodyFatPct ? String(initial.bodyFatPct) : "",
+  }));
+  const [msg, setMsg] = useState("");
+  const [saving, setSaving] = useState(false);
+  const draft: BodyProfile = {
+    sex: body.sex === "male" || body.sex === "female" ? body.sex : undefined,
+    birthYear: body.birthYear ? Number(body.birthYear) : undefined,
+    heightCm: body.heightCm ? Number(body.heightCm) : undefined,
+    weightKg: body.weightKg ? Number(body.weightKg) : undefined,
+    bodyFatPct: body.bodyFatPct ? Number(body.bodyFatPct) : undefined,
+  };
+  const corr = metCorrection(draft);
+  const set = (k: string, v: string) => { setBody((b) => ({ ...b, [k]: v })); setMsg(""); };
+  return <>
+    <p className="body-purpose">운동 강도와 소모 칼로리를 내 몸에 맞게 계산하는 데만 써요. 모두 선택이고, 설정에서 언제든 고치거나 지울 수 있어요. 점수 기준(30분마다 끊기·하루 7시간 등)은 모두에게 같아요.</p>
+    <div className="body-grid">
+      <label>성별<select value={body.sex} onChange={(e) => set("sex", e.target.value)}><option value="">선택 안 함</option><option value="male">남</option><option value="female">여</option></select></label>
+      <label>출생연도<input inputMode="numeric" placeholder="예: 2005" value={body.birthYear} onChange={(e) => set("birthYear", e.target.value.replace(/[^0-9]/g, "").slice(0, 4))} /></label>
+      <label>키 (cm)<input inputMode="decimal" placeholder="예: 175" value={body.heightCm} onChange={(e) => set("heightCm", e.target.value.replace(/[^0-9.]/g, ""))} /></label>
+      <label>몸무게 (kg)<input inputMode="decimal" placeholder="예: 70" value={body.weightKg} onChange={(e) => set("weightKg", e.target.value.replace(/[^0-9.]/g, ""))} /></label>
+      <label className="body-grid-wide">체지방률 (%) · 인바디 결과가 있으면<input inputMode="decimal" placeholder="모르면 비워두세요" value={body.bodyFatPct} onChange={(e) => set("bodyFatPct", e.target.value.replace(/[^0-9.]/g, ""))} /></label>
+    </div>
+    <p className="body-preview">이 정보로 계산하면 정확도 <b>{corr.accuracy}</b>{corr.accuracy !== "기본" ? ` · 빠르게 걷기(기본 4.8 MET) → ${Math.round(4.8 * corr.factor * 10) / 10} MET` : " · 성별·출생연도·키·몸무게를 모두 넣으면 보정돼요"}</p>
+    {msg && <p className="panel-msg">{msg}</p>}
+    <div className="body-actions">
+      <button className="panel-save" disabled={saving} onClick={async () => { setSaving(true); const err = await onSave(draft); setSaving(false); setMsg(err ?? "저장했어요"); if (!err) onSaved?.(); }}>{saveLabel}</button>
+      {showDelete && <button className="panel-delete" onClick={async () => { const err = await onSave(null); if (!err) setBody(EMPTY_BODY); setMsg(err ?? "몸 정보를 지웠어요"); }}>모두 지우기</button>}
+    </div>
+  </>;
+}
+
+function BodyInfoScreen({ nickname, onSave, onDone }: { nickname: string; onSave: (p: BodyProfile | null) => Promise<string | null>; onDone: () => void }) {
+  return <div className="screen app-screen bodyinfo-screen"><StatusBar />
+    <div className="bodyinfo-top"><AppLogo /><button className="bodyinfo-skip" onClick={onDone}>나중에 할게요</button></div>
+    <div className="bodyinfo-intro"><span className="section-kicker">ALMOST THERE · 선택</span><h2>{nickname}님 몸에 맞게<br />계산해 드릴게요</h2><p>같은 계단을 올라도 사람마다 힘든 정도가 달라요. 몸 정보를 알려주시면 운동 강도와 칼로리를 내 몸 기준으로 계산해요.</p></div>
+    <div className="bodyinfo-card"><BodyForm initial={{}} onSave={onSave} saveLabel="저장하고 시작하기" onSaved={onDone} /></div>
+    <div className="bodyinfo-levels"><div><b>기본</b><span>입력 없음 · 표준 강도로 계산</span></div><div><b>보통</b><span>성별·출생연도·키·몸무게</span></div><div><b>높음</b><span>+ 체지방률 (근육·지방 구분)</span></div></div>
+    <p className="medical-note"><ShieldCheck size={13} /> 입력하지 않아도 점수는 똑같이 계산돼요. 강도 보정만 빠져요.</p>
+  </div>;
+}
+
 function SettingsScreen({
   user,
   onNavigate,
@@ -663,7 +812,11 @@ function SettingsScreen({
   onImportIcs,
   onOpenTimetable,
   onLogout,
+  profile,
+  onSaveProfile,
 }: {
+  profile: BodyProfile;
+  onSaveProfile: (p: BodyProfile | null) => Promise<string | null>;
   user: SessionUser;
   onNavigate: (next: NavItem["id"]) => void;
   onUpdateBreakInterval: (minutes: number) => void;
@@ -696,6 +849,7 @@ function SettingsScreen({
   const [importMsg, setImportMsg] = useState("");
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const savedAcc = metCorrection(profile).accuracy;
   const toggleRow = (row: string) => setOpenRow((current) => current === row ? "" : row);
 
   const runImport = async (source: { ics?: string; url?: string }) => {
@@ -718,6 +872,11 @@ function SettingsScreen({
       {nickMsg && <p className="panel-msg">{nickMsg}</p>}
       <button className="panel-save" onClick={async () => { const err = await onSaveNickname(nick.trim()); setNickMsg(err ?? "저장했어요"); }}>저장</button>
     </div>}
+    <div className="settings-group">
+      <span className="settings-group-label">맞춤 점수</span>
+      <div className="setting-row setting-row--clickable" onClick={() => toggleRow("body")}><span className="setting-icon setting-icon--orange"><HeartPulse size={17} /></span><div><strong>내 몸 정보 (선택)</strong><small>운동 강도 계산 정확도: {savedAcc}{savedAcc === "기본" ? " · 입력하면 내 몸에 맞게 보정돼요" : ""}</small></div><ChevronRight size={17} /></div>
+      {openRow === "body" && <div className="inline-panel body-panel"><BodyForm initial={profile} onSave={onSaveProfile} saveLabel="저장" showDelete /></div>}
+    </div>
     <div className="settings-group">
       <span className="settings-group-label">알림 & 일정</span>
       <div className="setting-row"><span className="setting-icon setting-icon--green"><Bell size={17} /></span><div><strong>앱 안 알림</strong><small>{notifyOn ? "앱이 열려 있을 때 알려드려요" : "알림이 꺼져 있어요"}</small></div><button className={`toggle ${notifyOn ? "is-on" : ""}`} onClick={onToggleNotify}><span /></button></div>
@@ -805,7 +964,11 @@ export default function Home() {
   const [notifyOn, setNotifyOn] = useState(() => {
     try { return localStorage.getItem("sijakjeom_notif") !== "off"; } catch { return true; }
   });
-  const [score_bonus, setBonus] = useState(0);
+  const [todayMoves, setTodayMoves] = useState<MoveRecord[]>([]);
+  const [todayRecoveries, setTodayRecoveries] = useState<RecoveryRecord[]>([]);
+  const [score, setScore] = useState<ScoreBreakdown>(EMPTY_SCORE);
+  const [goal, setGoal] = useState<DailyGoal | null>(null);
+  const [profile, setProfile] = useState<BodyProfile>({});
   const [autoDetect, setAutoDetect] = useState(() => {
     try { return localStorage.getItem("sijakjeom_autodetect") === "on"; } catch { return false; }
   });
@@ -833,7 +996,11 @@ export default function Home() {
     setContinuousSeconds(dash.continuousSeconds);
     setTodaySeconds(dash.todaySeconds);
     setMovementCount(dash.todayMovementCount);
-    setBonus(dash.todayBonusPoints ?? 0);
+    setTodayMoves(dash.todayMoves ?? []);
+    setTodayRecoveries(dash.todayRecoveries ?? []);
+    if (dash.score) setScore(dash.score);
+    setGoal(dash.goal ?? null);
+    setProfile(dash.profile ?? {});
     setQuiet(dash.quiet);
   };
 
@@ -850,7 +1017,7 @@ export default function Home() {
     window.history.replaceState({}, "", window.location.pathname);
     if (err) { setAuthError(err); setScreen("auth"); return; }
     api.exchangeTicket(ticket!)
-      .then((r) => { saveSession(r.user); setSession(r.user); setScreen("home"); })
+      .then((r) => enterApp(r.user))
       .catch((e) => { setAuthError(e instanceof ApiError ? e.message : "로그인에 실패했어요."); setScreen("auth"); });
   }, []);
 
@@ -951,6 +1118,16 @@ export default function Home() {
     }
   }, [continuousSeconds >= (session?.breakIntervalMin ?? 30) * 60, quiet, session?.breakIntervalMin, trackingOn, notifyOn, pushOn]);
 
+  const BODY_ASKED_KEY = "sijakjeom_bodyinfo_asked_";
+  const enterApp = (user: SessionUser) => {
+    saveSession(user);
+    setSession(user);
+    const hasProfile = !!user.profile && Object.keys(user.profile).length > 0;
+    let asked = false;
+    try { asked = localStorage.getItem(BODY_ASKED_KEY + user.id) === "1"; localStorage.setItem(BODY_ASKED_KEY + user.id, "1"); } catch { /* 무시 */ }
+    setScreen(!hasProfile && !asked ? "bodyinfo" : "home");
+  };
+
   const handleAuthSubmit = async (payload: { nickname: string; email: string; password: string }) => {
     setAuthError("");
     setAuthSubmitting(true);
@@ -958,9 +1135,7 @@ export default function Home() {
       const result = authMode === "login"
         ? await api.login(payload.email, payload.password)
         : await api.signup(payload.nickname, payload.email, payload.password);
-      saveSession(result.user);
-      setSession(result.user);
-      setScreen("home");
+      enterApp(result.user);
     } catch (e) {
       setAuthError(e instanceof ApiError ? e.message : "잠시 후 다시 시도해주세요.");
     } finally {
@@ -973,9 +1148,7 @@ export default function Home() {
     setAuthSubmitting(true);
     try {
       const result = await api.loginGoogle(credential);
-      saveSession(result.user);
-      setSession(result.user);
-      setScreen("home");
+      enterApp(result.user);
     } catch (e) {
       setAuthError(e instanceof ApiError ? e.message : "구글 로그인에 실패했어요.");
     } finally {
@@ -1231,19 +1404,39 @@ export default function Home() {
     }
   };
 
-  const handleMoveComplete = async (bonusPoints: number) => {
+  const handleMoveComplete = async (exerciseId: string, durationSec: number, asRecovery: boolean) => {
     if (!session) return;
     setScreen("home");
-    showToast(`움직임이 기록되었어요 · 오늘 ${movementCount + 1}회${bonusPoints ? ` · 보너스 +${bonusPoints}%` : ""}`);
+    const name = EXERCISE_BY_ID[exerciseId]?.name ?? "움직임";
     setContinuousSeconds(0);
     notifiedRef.current = false;
     try {
-      const result = await api.logMovement(session.id, bonusPoints);
+      const result = await api.logMovement(session.id, exerciseId, durationSec, asRecovery);
+      const gain = Math.round((result.score.total - score.total) * 10) / 10;
+      showToast(`${name} ${Math.max(1, Math.round(durationSec / 60))}분 기록 · 오늘 ${result.score.total}점${gain > 0 ? ` (+${gain})` : ""}`);
       setMovementCount(result.todayMovementCount);
-      setBonus(result.todayBonusPoints);
+      setTodayMoves(result.todayMoves);
+      setTodayRecoveries(result.todayRecoveries);
+      setScore(result.score);
+      setGoal(result.goal);
       setContinuousSeconds(result.continuousSeconds);
     } catch {
-      /* 다음 동기화 주기에서 정합성 맞춰짐 */
+      showToast("기록하지 못했어요. 잠시 후 다시 시도해주세요.");
+    }
+  };
+
+  const handleSaveProfile = async (p: BodyProfile | null): Promise<string | null> => {
+    if (!session) return "로그인이 필요해요";
+    try {
+      const r = await api.updateUser(session.id, { profile: p });
+      saveSession(r.user);
+      setSession(r.user);
+      setProfile(r.user.profile ?? {});
+      const dash = await api.getDashboard(session.id);
+      syncFromDashboard(dash);
+      return null;
+    } catch (e) {
+      return e instanceof ApiError ? e.message : "저장하지 못했어요";
     }
   };
 
@@ -1268,7 +1461,8 @@ export default function Home() {
       // 로그인하지 않은 상태에서 메인 화면 그룹으로 진입하면 로그인으로 보냄
       return <AuthScreen mode={authMode} onModeChange={(m) => { setAuthMode(m); setAuthError(""); }} onBack={() => setScreen("splash")} onSubmit={handleAuthSubmit} onGoogle={handleGoogle} googleClientId={googleClientId} providers={providers} submitting={authSubmitting} error={authError} />;
     }
-    if (screen === "timer") return <TimerScreen mode={moveMode} baseScore={scoreOf(movementCount, score_bonus)} nextScoreOf={(b) => scoreOf(movementCount + 1, score_bonus + b)} onComplete={handleMoveComplete} onBack={() => { setScreen("home"); setMoveSheetOpen(true); }} />;
+    if (screen === "bodyinfo") return <BodyInfoScreen nickname={session.nickname} onSave={handleSaveProfile} onDone={() => setScreen("home")} />;
+    if (screen === "timer") return <TimerScreen key={moveMode} mode={moveMode} todaySeconds={todaySeconds} continuousSeconds={continuousSeconds} moves={todayMoves} recoveries={todayRecoveries} profile={profile} onComplete={handleMoveComplete} onBack={() => { setScreen("home"); setMoveSheetOpen(true); }} />;
     if (screen === "timetable") return <TimetableScreen blocks={schedule} quietEnabled={session.scheduleQuietEnabled} onToggleQuiet={() => handleUpdateQuietEnabled(!session.scheduleQuietEnabled)} bottomNav={<BottomNav current="timetable" onNavigate={goToMain} />} onSave={handleSaveClass} onDelete={handleDeleteClass} />;
     if (screen === "calendar") return <CalendarScreen userId={session.id} onNavigate={goToMain} />;
     if (screen === "stats") return <StatsScreen userId={session.id} onNavigate={goToMain} weeklyMinutes={weeklyMinutes} breakIntervalMin={session.breakIntervalMin} />;
@@ -1298,6 +1492,8 @@ export default function Home() {
         onUpdateBlock={handleUpdateScheduleBlock}
         onRemoveBlock={handleRemoveScheduleBlock}
         onLogout={handleLogout}
+        profile={profile}
+        onSaveProfile={handleSaveProfile}
       />
     );
     return (
@@ -1306,7 +1502,8 @@ export default function Home() {
         continuousSeconds={continuousSeconds}
         todaySeconds={todaySeconds}
         movementCount={movementCount}
-        score={scoreOf(movementCount, score_bonus)}
+        score={score}
+        goal={goal}
         zone={zone}
         trackingOn={trackingOn}
         autoPaused={autoPaused}
@@ -1315,7 +1512,7 @@ export default function Home() {
         onNavigate={goToMain}
       />
     );
-  }, [authMode, authSubmitting, authError, moveMode, onboardingStep, screen, session, continuousSeconds, todaySeconds, movementCount, zone, trackingOn, weeklyMinutes, schedule, reminders, notifyOn, pushOn, pushSupported, googleClientId, providers, autoDetect, autoPaused, gpsMsg, score_bonus]);
+  }, [authMode, authSubmitting, authError, moveMode, onboardingStep, screen, session, continuousSeconds, todaySeconds, movementCount, zone, trackingOn, weeklyMinutes, schedule, reminders, notifyOn, pushOn, pushSupported, googleClientId, providers, autoDetect, autoPaused, gpsMsg, score, goal, profile, todayMoves, todayRecoveries]);
 
   return <main className="prototype-page"><div className="ambient ambient-one" /><div className="ambient ambient-two" /><div className="prototype-layout"><PrototypeRail screen={screen} onNavigate={goTo} /><PhoneShell screen={screen}>{screenContent}{moveSheetOpen && <MoveSheet onClose={() => setMoveSheetOpen(false)} onSelect={chooseMove} />}{askSitting && <div className="sheet-backdrop"><div className="move-sheet" onClick={(e) => e.stopPropagation()}><div className="sheet-handle" /><div className="sheet-heading"><div><span className="section-kicker">ARE YOU SITTING?</span><h2>지금 앉아 계신가요?</h2><p>움직임이 멈춘 것 같아요. 앉았다면 좌식 타이머를 다시 켤게요.</p></div></div><div className="ask-actions"><button className="primary-button" onClick={() => { setAskSitting(false); void setTracking(true, false); }}><Check size={17} /> 네, 앉았어요</button><button className="secondary-button" onClick={() => setAskSitting(false)}>아니요, 계속 움직여요</button></div></div></div>}{toast && <div className="toast-message"><Check size={16} /> {toast}</div>}</PhoneShell></div><footer className="prototype-footer"><span>INTERACTIVE MOBILE PROTOTYPE</span><span>사용자 행동을 바꾸는 가장 작은 시작점</span><span>© 2026 SIJAKJEOM</span></footer></main>;
 }

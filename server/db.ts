@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import pg from "pg";
+import { scoreDay, dailyGoal, EXERCISE_BY_ID, type BodyProfile, type MoveRecord, type RecoveryRecord, type ScoreBreakdown } from "../shared/scoring";
 
 // process.cwd() 기준으로 고정 (esbuild로 번들된 뒤에는 import.meta.dirname이
 // dist/ 를 가리켜서, 빌드할 때마다 데이터가 날아갈 수 있기 때문)
@@ -46,6 +47,7 @@ export type User = {
   breakIntervalMin: number; // 권장 휴식 주기 (분)
   scheduleQuietEnabled: boolean;
   trackingEnabled?: boolean; // 좌식 타이머 온/오프 (없으면 켜짐)
+  profile?: BodyProfile; // 몸 정보 (선택 입력, 운동 강도 보정용)
   createdAt: string;
 };
 
@@ -54,16 +56,24 @@ export type DayLog = {
   movementCount: number;
   maxContinuousSeconds?: number; // 그날 가장 오래 연속으로 앉아있던 시간
   edema?: EdemaLevel; // 그날 기록한 부종 정도
-  bonusPoints?: number; // 권장 시간 이상 채운 움직임 타이머 보너스(%p) 누적
+  bonusPoints?: number; // (예전 점수식) 더 이상 쓰지 않음
+  moves?: MoveRecord[]; // 움직임 기록: 어떤 운동을, 몇 초, 직전에 몇 분 앉아 있다가
+  recoveries?: RecoveryRecord[]; // 회복 활동 기록 (D 점수)
 };
 
-export const DAILY_MOVEMENT_TARGET = 8; // 하루 움직임 8회 = 달성도 100%
-export const MAX_BONUS_PER_MOVEMENT = 10;
+// 예전 형식(moves 없이 횟수만)으로 저장된 날은 "30~60분 뒤 1분 가볍게 걷기"로 보수적으로 환산
+function movesOf(log: DayLog): MoveRecord[] {
+  if (log.moves) return log.moves;
+  return Array.from({ length: log.movementCount }, () => ({ at: "", exerciseId: "walk_easy", durationSec: 60, priorSitSec: 45 * 60 }));
+}
 
-// 움직임 점수(%) = min(100, 횟수/8*100 + 보너스)
-export function scoreOf(log: { movementCount: number; bonusPoints?: number } | undefined) {
-  if (!log) return 0;
-  return Math.min(100, Math.round((log.movementCount / DAILY_MOVEMENT_TARGET) * 100) + (log.bonusPoints ?? 0));
+export function scoreOfDay(log: DayLog | undefined, profile?: BodyProfile): ScoreBreakdown {
+  return scoreDay({
+    sitSeconds: log?.totalSeconds ?? 0,
+    moves: log ? movesOf(log) : [],
+    recoveries: log?.recoveries ?? [],
+    profile,
+  });
 }
 
 type DB = {
@@ -254,7 +264,7 @@ export function getUser(id: string): User | undefined {
   return db.users[id];
 }
 
-export function updateUser(id: string, patch: Partial<Pick<User, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled">>) {
+export function updateUser(id: string, patch: Partial<Pick<User, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled" | "profile">>) {
   const user = db.users[id];
   if (!user) return undefined;
   const wasOn = user.trackingEnabled !== false;
@@ -288,15 +298,33 @@ function bumpMaxContinuous(userId: string, dayLog: DayLog) {
   if (elapsed > (dayLog.maxContinuousSeconds ?? 0)) dayLog.maxContinuousSeconds = elapsed;
 }
 
-export function markMoved(userId: string, bonusPoints = 0) {
+/**
+ * 움직임 기록. durationSec 동안 운동했으므로, 직전 연속 좌식 시간 = (지금 − 마지막 움직임) − 운동 시간.
+ * 회복 활동(category=recovery, 또는 asRecovery=true로 길게 한 숨찬 활동)은 D 점수용으로 따로 쌓는다.
+ */
+export function markMoved(userId: string, exerciseId: string, durationSec: number, asRecovery = false) {
+  const ex = EXERCISE_BY_ID[exerciseId];
+  if (!ex) return null;
   const date = todayIso();
   const userLog = (db.sitting[userId] ??= {});
   const dayLog = (userLog[date] ??= { totalSeconds: 0, movementCount: 0 });
-  bumpMaxContinuous(userId, dayLog); // 리셋 직전의 연속 좌식시간을 최대값에 반영
+  const dur = Math.max(0, Math.min(Math.round(durationSec) || 0, 4 * 3600));
+  const trackingOn = db.users[userId]?.trackingEnabled !== false;
+  const last = db.state[userId]?.lastMovedAt;
+  const sinceLast = last ? Math.max(0, Math.round((Date.now() - new Date(last).getTime()) / 1000)) : 0;
+  const priorSitSec = trackingOn ? Math.max(0, sinceLast - dur) : 0;
+  if (trackingOn && priorSitSec > (dayLog.maxContinuousSeconds ?? 0)) dayLog.maxContinuousSeconds = priorSitSec;
   db.state[userId] = { lastMovedAt: new Date().toISOString() };
-  dayLog.movementCount += 1;
-  dayLog.bonusPoints = (dayLog.bonusPoints ?? 0) + Math.max(0, Math.min(MAX_BONUS_PER_MOVEMENT, Math.round(bonusPoints) || 0));
+  const at = new Date().toISOString();
+  if (ex.category === "recovery" || asRecovery) {
+    (dayLog.recoveries ??= []).push({ at, exerciseId, durationSec: dur });
+  } else {
+    if (!dayLog.moves) dayLog.moves = movesOf(dayLog).slice(); // 예전 기록이 있으면 형식 변환
+    dayLog.moves.push({ at, exerciseId, durationSec: dur, priorSitSec });
+    dayLog.movementCount += 1;
+  }
   save(db);
+  return dayLog;
 }
 
 export function addHeartbeatSeconds(userId: string, seconds: number) {
@@ -321,23 +349,36 @@ export function getMonthLog(userId: string, month: string) {
       movementCount: log.movementCount,
       maxContinuousSeconds: log.maxContinuousSeconds ?? 0,
       edema: log.edema ?? null,
-      bonusPoints: log.bonusPoints ?? 0,
-      score: scoreOf(log),
-      prev7Avg: prev7AvgScore(logs, date),
+      score: scoreOfDay(log, db.users[userId]?.profile).total,
+      breakdown: scoreOfDay(log, db.users[userId]?.profile),
+      prev7Avg: prev7AvgScore(logs, date, db.users[userId]?.profile),
     }));
 }
 
-// 해당 날짜 직전 7일 중 기록이 있는 날들의 평균 점수 (없으면 null)
-function prev7AvgScore(logs: Record<string, DayLog>, date: string) {
+function pastDates(date: string, days: number) {
   const base = new Date(date + "T00:00:00+09:00");
-  const scores: number[] = [];
-  for (let i = 1; i <= 7; i++) {
+  return Array.from({ length: days }, (_, i) => {
     const d = new Date(base);
-    d.setDate(d.getDate() - i);
-    const l = logs[d.toLocaleDateString("en-CA", { timeZone: "Asia/Seoul" })];
-    if (l && (l.movementCount > 0 || l.totalSeconds > 0)) scores.push(scoreOf(l));
-  }
-  return scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+    d.setDate(d.getDate() - (i + 1));
+    return d.toLocaleDateString("en-CA", { timeZone: "Asia/Seoul" });
+  });
+}
+
+const hasRecord = (l?: DayLog) => !!l && (l.movementCount > 0 || l.totalSeconds > 0 || (l.recoveries?.length ?? 0) > 0);
+
+// 해당 날짜 직전 7일 중 기록이 있는 날들의 평균 점수 (없으면 null)
+function prev7AvgScore(logs: Record<string, DayLog>, date: string, profile?: BodyProfile) {
+  const scores = pastDates(date, 7).map((d) => logs[d]).filter(hasRecord).map((l) => scoreOfDay(l, profile).total);
+  return scores.length ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10 : null;
+}
+
+/** 나의 목표: 최근 7일 기록의 "끊기 인정 횟수" 평균에서 15% 올린 값 */
+export function getDailyGoal(userId: string) {
+  const logs = db.sitting[userId] ?? {};
+  const profile = db.users[userId]?.profile;
+  const past = pastDates(todayIso(), 7).map((d) => logs[d]).filter(hasRecord).map((l) => scoreOfDay(l, profile).credited1);
+  const today = scoreOfDay(logs[todayIso()], profile);
+  return { ...dailyGoal(past, today.targetBreaks), todayCredited: today.credited1 };
 }
 
 export function getTodayLog(userId: string): DayLog {
