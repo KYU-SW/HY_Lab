@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import pg from "pg";
 
 // process.cwd() 기준으로 고정 (esbuild로 번들된 뒤에는 import.meta.dirname이
 // dist/ 를 가리켜서, 빌드할 때마다 데이터가 날아갈 수 있기 때문)
@@ -89,12 +90,99 @@ function load(): DB {
   }
 }
 
-function save(db: DB) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf-8");
+// ---------- 영구 저장소 ----------
+// DATABASE_URL(Postgres, 예: Neon)이 있으면 DB 전체를 app_state 테이블 한 줄(jsonb)에 저장한다.
+// 없으면 예전처럼 db.json 파일에 저장한다(로컬 개발용).
+// Render 무료 플랜은 재시작 때 디스크가 초기화되므로, 배포 환경에서는 반드시 DATABASE_URL을 설정해야 한다.
+let pool: pg.Pool | null = null;
+let pgWrite: Promise<void> = Promise.resolve();
+let pgTimer: NodeJS.Timeout | null = null;
+let pgDirty = false;
+
+function writeToPg() {
+  if (!pool || !pgDirty) return pgWrite;
+  pgDirty = false;
+  const snapshot = JSON.stringify(db);
+  const p = pool;
+  // 쓰기를 순서대로 이어 붙여서, 늦게 시작한 저장이 먼저 끝나 덮어쓰는 일을 막는다.
+  pgWrite = pgWrite
+    .then(() =>
+      p.query(
+        `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1::jsonb, now())
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+        [snapshot],
+      ),
+    )
+    .then(() => undefined)
+    .catch((err) => {
+      pgDirty = true; // 실패하면 다음 저장 때 다시 시도
+      console.error("[db] Postgres 저장 실패:", err?.message ?? err);
+    });
+  return pgWrite;
 }
 
-// 모든 작업은 단순하게 매번 load/save 하는 구조 (동시성 요구가 낮은 소규모 프로토타입용)
+function save(_db: DB) {
+  if (pool) {
+    pgDirty = true;
+    // 짧은 시간에 여러 번 바뀌면 한 번만 저장 (요청마다 DB 왕복하지 않도록)
+    if (!pgTimer) {
+      pgTimer = setTimeout(() => {
+        pgTimer = null;
+        void writeToPg();
+      }, 300);
+    }
+    return;
+  }
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DB_PATH, JSON.stringify(_db, null, 2), "utf-8");
+}
+
+/** 대기 중인 저장을 즉시 끝낸다 (서버 종료 직전, 테스트용). */
+export async function flushDb() {
+  if (pgTimer) {
+    clearTimeout(pgTimer);
+    pgTimer = null;
+  }
+  await writeToPg();
+  await pgWrite;
+}
+
+/** 서버 시작 시 한 번 호출. DATABASE_URL이 있으면 Postgres에서 데이터를 불러온다. */
+export async function initDb() {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    console.log(`[db] DATABASE_URL 없음 → 파일 저장 사용 (${DB_PATH})`);
+    return;
+  }
+  const local = /localhost|127\.0\.0\.1/.test(url);
+  pool = new pg.Pool({ connectionString: url, ssl: local ? undefined : { rejectUnauthorized: false }, max: 3 });
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS app_state (id integer PRIMARY KEY, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`,
+  );
+  const res = await pool.query(`SELECT data FROM app_state WHERE id = 1`);
+  if (res.rows.length > 0) {
+    db = { ...emptyDb(), ...(res.rows[0].data as Partial<DB>) };
+    console.log(`[db] Postgres에서 불러옴 (사용자 ${Object.keys(db.users).length}명)`);
+  } else {
+    // 처음 연결: 파일에 있던 데이터가 있으면 그대로 옮긴다.
+    db = load();
+    pgDirty = true;
+    await writeToPg();
+    console.log(`[db] Postgres 첫 연결 — 기존 데이터 이전 (사용자 ${Object.keys(db.users).length}명)`);
+  }
+  const shutdown = async () => {
+    try {
+      await flushDb();
+      await pool?.end();
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+}
+
+// 모든 작업은 메모리의 db를 바꾸고 save()로 영구 저장소에 반영하는 구조 (소규모 프로토타입용)
 let db = load();
 
 export function hashPassword(password: string, salt = crypto.randomBytes(16).toString("hex")) {

@@ -4,6 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { registerApiRoutes } from "./api";
 import { initPush, startPushScheduler } from "./push";
+import { initDb } from "./db";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,7 @@ async function startServer() {
 
   app.use(express.json({ limit: "3mb" }));
   app.use(express.urlencoded({ extended: false }));
+  await initDb(); // DATABASE_URL이 있으면 Postgres에서 데이터를 불러온 뒤 시작
   initPush();
   startPushScheduler();
   registerApiRoutes(app);
@@ -41,4 +43,7 @@ async function startServer() {
   }
 }
 
-startServer().catch(console.error);
+startServer().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
