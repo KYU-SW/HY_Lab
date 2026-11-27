@@ -34,6 +34,16 @@ export type ReminderTime = {
   enabled: boolean;
 };
 
+/** 좌식 구간. estimate=타이머·움직임 기록으로 추정 / self=사용자가 앉았다고 확인 / unknown=타이머 꺼짐(미확인) */
+export type SitSource = "estimate" | "self" | "unknown";
+export type SitSegment = { start: string; end: string; source: SitSource };
+type UserState = {
+  lastMovedAt: string;
+  sitSource?: "estimate" | "self"; // 지금 이어지는 좌식 구간이 어떻게 시작됐나
+  offAt?: string; // 타이머를 끈 시각 (미확인 구간 시작)
+  held?: { at: string; lastMovedAt: string }; // 수업 중이라 보류한 알림
+};
+
 export type EdemaLevel = "없음" | "약함" | "보통" | "심함";
 
 export type PushSub = { endpoint: string; keys: { p256dh: string; auth: string } };
@@ -59,6 +69,7 @@ export type DayLog = {
   bonusPoints?: number; // (예전 점수식) 더 이상 쓰지 않음
   moves?: MoveRecord[]; // 움직임 기록: 어떤 운동을, 몇 초, 직전에 몇 분 앉아 있다가
   recoveries?: RecoveryRecord[]; // (예전 형식) 회복 활동 기록 — 지금은 moves에 함께 저장
+  segments?: SitSegment[]; // 좌식 구간 (끝난 것만)
   goal?: number; // 사용자가 정한 오늘 일어나기 목표
   plannedSitMin?: number; // "오늘 몇 시간 앉을 것 같아요?" 답 (분)
 };
@@ -107,7 +118,7 @@ export function summaryOf(userId: string, date: string, log?: DayLog): DaySummar
 type DB = {
   users: Record<string, User>;
   sitting: Record<string, Record<string, DayLog>>; // userId -> date(YYYY-MM-DD) -> log
-  state: Record<string, { lastMovedAt: string }>; // userId -> continuous timer anchor
+  state: Record<string, UserState>; // userId -> continuous timer anchor
   schedule: Record<string, ScheduleBlock[]>; // userId -> blocks
   reminders: Record<string, ReminderTime[]>; // userId -> 지정 시각 알림
   pushSubs: Record<string, PushSub[]>; // userId -> 웹 푸시 구독
@@ -297,21 +308,63 @@ export function updateUser(id: string, patch: Partial<Pick<User, "nickname" | "b
   if (!user) return undefined;
   const wasOn = user.trackingEnabled !== false;
   if (wasOn && patch.trackingEnabled === false) {
-    // 끄는 순간까지의 연속 좌식시간을 그날 최대값에 반영
+    // 끄는 순간까지의 연속 좌식시간을 그날 최대값·좌식 구간에 반영하고, 이후는 미확인
     const userLog = (db.sitting[id] ??= {});
     const dayLog = (userLog[todayIso()] ??= { totalSeconds: 0, movementCount: 0 });
     bumpMaxContinuous(id, dayLog);
+    closeSegment(id, dayLog, Date.now());
+    db.state[id] = { ...(db.state[id] ?? { lastMovedAt: new Date().toISOString() }), offAt: new Date().toISOString(), held: undefined };
   }
   Object.assign(user, patch);
-  // 꺼져 있다가 다시 켜면 연속 좌식시간을 0부터 새로 시작
+  // 꺼져 있다가 다시 켜면(= 사용자가 앉았다고 확인) 연속 좌식시간을 0부터 새로 시작
   if (!wasOn && user.trackingEnabled !== false) {
-    db.state[id] = { lastMovedAt: new Date().toISOString() };
+    const prev = db.state[id];
+    if (prev?.offAt) {
+      const dayLog = ((db.sitting[id] ??= {})[todayIso()] ??= { totalSeconds: 0, movementCount: 0 });
+      pushSegment(dayLog, { start: prev.offAt, end: new Date().toISOString(), source: "unknown" });
+    }
+    db.state[id] = { lastMovedAt: new Date().toISOString(), sitSource: "self" };
   }
   save(db);
   return user;
 }
 
 // ---------- Sitting / 연속 좌식 ----------
+
+function pushSegment(dayLog: DayLog, seg: SitSegment) {
+  if (new Date(seg.end).getTime() - new Date(seg.start).getTime() < 60_000) return; // 1분 미만은 버림
+  (dayLog.segments ??= []).push(seg);
+}
+
+/** 지금 이어지던 좌식 구간을 endMs에 끝내고 기록 (타이머가 켜져 있을 때만) */
+function closeSegment(userId: string, dayLog: DayLog, endMs: number) {
+  if (db.users[userId]?.trackingEnabled === false) return;
+  const st = db.state[userId];
+  if (!st?.lastMovedAt) return;
+  const startMs = new Date(st.lastMovedAt).getTime();
+  // 날짜가 바뀌었으면 오늘 0시부터로 자름
+  const dayStart = new Date(todayIso() + "T00:00:00+09:00").getTime();
+  pushSegment(dayLog, { start: new Date(Math.max(startMs, dayStart)).toISOString(), end: new Date(endMs).toISOString(), source: st.sitSource ?? "estimate" });
+}
+
+export function getCurrentSegment(userId: string): { start: string; source: SitSource } | null {
+  if (db.users[userId]?.trackingEnabled === false) {
+    const off = db.state[userId]?.offAt;
+    return off ? { start: off, source: "unknown" } : null;
+  }
+  const st = db.state[userId];
+  return st ? { start: st.lastMovedAt, source: st.sitSource ?? "estimate" } : null;
+}
+
+// ---------- 수업 중 보류 알림 ----------
+
+export function getHeld(userId: string) { return db.state[userId]?.held; }
+export function setHeld(userId: string, held: UserState["held"]) {
+  const st = db.state[userId];
+  if (!st) return;
+  st.held = held;
+  save(db);
+}
 
 export function getLastMovedAt(userId: string): string {
   if (!db.state[userId]) db.state[userId] = { lastMovedAt: new Date().toISOString() };
@@ -344,7 +397,9 @@ export function markMoved(userId: string, exerciseId: string, durationSec: numbe
   const priorSitSec = trackingOn ? Math.max(0, sinceLast - (standing ? dur : 0)) : 0;
   if (standing) {
     if (trackingOn && priorSitSec > (dayLog.maxContinuousSeconds ?? 0)) dayLog.maxContinuousSeconds = priorSitSec;
-    db.state[userId] = { lastMovedAt: new Date().toISOString() };
+    if (trackingOn) closeSegment(userId, dayLog, Date.now() - dur * 1000);
+    // 움직인 뒤 다시 앉는 건 자동으로 추정 (보류 알림도 취소)
+    db.state[userId] = { ...db.state[userId], lastMovedAt: new Date().toISOString(), sitSource: "estimate", held: undefined };
   }
   if (!dayLog.moves) dayLog.moves = movesOf(dayLog).slice(); // 예전 기록이 있으면 형식 변환
   dayLog.moves.push({ at: new Date().toISOString(), exerciseId, durationSec: dur, priorSitSec });
@@ -396,6 +451,7 @@ export function getMonthLog(userId: string, month: string) {
       maxContinuousSeconds: log.maxContinuousSeconds ?? 0,
       edema: log.edema ?? null,
       summary: summaryOf(userId, date, log),
+      segments: log.segments ?? [],
     }));
 }
 

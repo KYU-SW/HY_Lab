@@ -436,3 +436,20 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(34, 197, 94,
 .rec-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 20px 10px; }
 .rec-actions .secondary-button { flex: 1; min-height: 40px; font-size: 12px; }
 .rec-count { color: var(--muted); font-size: 10px; text-align: center; }
+
+/* ---- 좌식 구간 (수식 B·C) ---- */
+.segment-box { margin: 12px 0 0; padding: 10px 12px; border-radius: 14px; background: #fff; border: 1px solid #e3ece6; }
+.calendar-screen .segment-box { margin: 8px 0; }
+.segment-head { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 0; border: 0; background: none; color: var(--ink-soft); font-size: 10.5px; text-align: left; }
+.segment-head b { color: var(--ink); }
+.segment-head svg { transition: transform .2s; flex: 0 0 auto; }
+.segment-head svg.is-open { transform: rotate(180deg); }
+.segment-list { margin: 8px 0 0; padding: 0; list-style: none; }
+.segment-list li { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; padding: 5px 0; border-top: 1px dashed #edf2ee; font-size: 10.5px; color: var(--ink-soft); }
+.segment-list li b { color: var(--ink); font-size: 11px; }
+.segment-list li.is-longest b { color: #c2410c; }
+.seg-src { padding: 2px 6px; border-radius: 99px; font-style: normal; font-size: 9px; font-weight: 700; }
+.seg-src--estimate { background: #eef2ef; color: var(--ink-soft); }
+.seg-src--self { background: #e5f6c8; color: #3f6b0b; }
+.seg-src--unknown { background: #fde1df; color: #a1261b; }
+.segment-note, .segment-empty { margin: 6px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }

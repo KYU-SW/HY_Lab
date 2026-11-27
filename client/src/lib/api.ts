@@ -18,6 +18,9 @@ export type TodayInfo = {
   history: Record<string, number>; // 최근 14일 운동별 완료 횟수
 };
 
+export type SitSource = "estimate" | "self" | "unknown";
+export type SitSegment = { start: string; end: string; source: SitSource };
+
 export type RiskZone = { level: "safe" | "notice" | "risk"; label: string };
 
 export type Dashboard = TodayInfo & {
@@ -26,6 +29,8 @@ export type Dashboard = TodayInfo & {
   todayMovementCount: number;
   todayMoves: MoveRecord[];
   todayRecoveries: RecoveryRecord[];
+  todaySegments: SitSegment[];
+  currentSegment: { start: string; source: SitSource } | null;
   profile: BodyProfile;
   accuracy: Accuracy;
   breakIntervalMin: number;
@@ -42,6 +47,7 @@ export type CalendarDay = {
   maxContinuousSeconds: number;
   edema: EdemaLevel | null;
   summary: DaySummary;
+  segments: SitSegment[];
 };
 
 export type EdemaLevel = "없음" | "약함" | "보통" | "심함";
