@@ -1,0 +1,18 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> sijakjeom-preview@1.0.0 build
+> vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist
+
+vite v7.3.7 building client environment for production...
+transforming...
+✓ 1576 modules transformed.
+rendering chunks...
+computing gzip size...
+../dist/public/index.html                 367.72 kB │ gzip: 105.56 kB
+../dist/public/assets/index-yJ88KnJr.css  145.08 kB │ gzip:  26.73 kB
+../dist/public/assets/index-BHADvYh2.js   363.44 kB │ gzip: 106.76 kB
+✓ built in 1.71s
+
+  dist/index.js  62.2kb
+
+⚡ Done in 4ms
