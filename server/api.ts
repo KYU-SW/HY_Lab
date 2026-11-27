@@ -18,8 +18,9 @@ import {
   findUserByEmail,
   getLastMovedAt,
   getMonthLog,
-  getDailyGoal,
-  scoreOfDay,
+  getToday,
+  moveHistory,
+  setTodayPlan,
   getTodayLog,
   getUser,
   getWeeklyLog,
@@ -35,7 +36,7 @@ import {
 } from "./db";
 import { fetchIcsFromUrl, parseIcs } from "./ics";
 import { getPublicKey } from "./push";
-import { EXERCISE_BY_ID, metCorrection, type BodyProfile } from "../shared/scoring";
+import { EXERCISE_BY_ID, LIMITATIONS, metCorrection, type BodyProfile, type Limitation } from "../shared/scoring";
 
 // 몸 정보 검증: 범위를 벗어나거나 비운 값은 저장하지 않음 (모두 선택 입력)
 function cleanProfile(raw: unknown): BodyProfile | null {
@@ -58,6 +59,16 @@ function cleanProfile(raw: unknown): BodyProfile | null {
   if (w) p.weightKg = w;
   const bf = num(r.bodyFatPct, 3, 70);
   if (bf) p.bodyFatPct = bf;
+  if (given(r.activityLevel) && !["low", "mid", "high"].includes(r.activityLevel as string)) return null;
+  if (r.activityLevel === "low" || r.activityLevel === "mid" || r.activityLevel === "high") p.activityLevel = r.activityLevel;
+  if (Array.isArray(r.limitations)) {
+    const ok = r.limitations.filter((l): l is Limitation => LIMITATIONS.includes(l as Limitation));
+    if (ok.length) p.limitations = Array.from(new Set(ok));
+  }
+  if (Array.isArray(r.excluded)) {
+    const ok = r.excluded.filter((x): x is string => typeof x === "string" && !!EXERCISE_BY_ID[x]);
+    if (ok.length) p.excluded = Array.from(new Set(ok));
+  }
   // 값을 넣었는데 범위를 벗어난 항목이 있으면 저장하지 않고 거부 (기존 정보를 지우지 않도록)
   if ((given(r.birthYear) && !p.birthYear) || (given(r.heightCm) && !p.heightCm) || (given(r.weightKg) && !p.weightKg) || (given(r.bodyFatPct) && !p.bodyFatPct)) return null;
   return p;
@@ -183,8 +194,8 @@ export function registerApiRoutes(app: Express) {
       todayMovementCount: today.movementCount,
       todayMoves: today.moves ?? [],
       todayRecoveries: today.recoveries ?? [],
-      score: scoreOfDay(today, user.profile),
-      goal: getDailyGoal(id),
+      ...getToday(id),
+      history: moveHistory(id),
       profile: user.profile ?? {},
       accuracy: metCorrection(user.profile).accuracy,
       breakIntervalMin: user.breakIntervalMin,
@@ -210,17 +221,33 @@ export function registerApiRoutes(app: Express) {
     const exerciseId = String(req.body?.exerciseId ?? "");
     if (!EXERCISE_BY_ID[exerciseId]) return res.status(400).json({ error: "알 수 없는 운동이에요." });
     const durationSec = Number(req.body?.durationSec) || 0;
-    const asRecovery = req.body?.asRecovery === true;
-    const dayLog = markMoved(id, exerciseId, durationSec, asRecovery)!;
-    const user = getUser(id)!;
+    const dayLog = markMoved(id, exerciseId, durationSec)!;
     res.json({
       todayMovementCount: dayLog.movementCount,
       todayMoves: dayLog.moves ?? [],
       todayRecoveries: dayLog.recoveries ?? [],
-      score: scoreOfDay(dayLog, user.profile),
-      goal: getDailyGoal(id),
-      continuousSeconds: 0,
+      ...getToday(id),
+      history: moveHistory(id),
+      standing: EXERCISE_BY_ID[exerciseId].category !== "seated",
     });
+  });
+
+  // 오늘 목표 / 예정 앉은 시간 (null이면 지움)
+  app.put("/api/users/:id/today", (req, res) => {
+    const id = requireUser(req, res);
+    if (!id) return;
+    const { goal, plannedSitMin } = req.body ?? {};
+    const patch: { goal?: number | null; plannedSitMin?: number | null } = {};
+    if (goal !== undefined) {
+      if (goal !== null && !(Number.isInteger(goal) && goal >= 1 && goal <= 48)) return res.status(400).json({ error: "목표는 1~48회로 정해주세요." });
+      patch.goal = goal;
+    }
+    if (plannedSitMin !== undefined) {
+      if (plannedSitMin !== null && !(Number.isFinite(plannedSitMin) && plannedSitMin >= 30 && plannedSitMin <= 16 * 60)) return res.status(400).json({ error: "앉을 시간은 30분~16시간 사이로 정해주세요." });
+      patch.plannedSitMin = plannedSitMin === null ? null : Math.round(plannedSitMin);
+    }
+    setTodayPlan(id, patch);
+    res.json(getToday(id));
   });
 
   app.get("/api/weekly/:id", (req, res) => {

@@ -1,4 +1,4 @@
-import type { Accuracy, BodyProfile, MoveRecord, RecoveryRecord, ScoreBreakdown } from "@shared/scoring";
+import type { Accuracy, BodyProfile, DaySummary, MoveRecord, RecoveryRecord } from "@shared/scoring";
 
 export type SessionUser = {
   id: string;
@@ -11,24 +11,21 @@ export type SessionUser = {
   createdAt: string;
 };
 
-export type DailyGoal = {
-  measuring: boolean;
-  daysCollected: number;
-  baseline?: number;
-  goal: number | null;
-  todayCredited: number;
+export type TodayInfo = {
+  summary: DaySummary;
+  suggestGoal: number | null; // 목표 올리기 제안 (없으면 null)
+  streak: number; // 연속 달성 일수
+  history: Record<string, number>; // 최근 14일 운동별 완료 횟수
 };
 
 export type RiskZone = { level: "safe" | "notice" | "risk"; label: string };
 
-export type Dashboard = {
+export type Dashboard = TodayInfo & {
   continuousSeconds: number;
   todaySeconds: number;
   todayMovementCount: number;
   todayMoves: MoveRecord[];
   todayRecoveries: RecoveryRecord[];
-  score: ScoreBreakdown;
-  goal: DailyGoal;
   profile: BodyProfile;
   accuracy: Accuracy;
   breakIntervalMin: number;
@@ -44,9 +41,7 @@ export type CalendarDay = {
   movementCount: number;
   maxContinuousSeconds: number;
   edema: EdemaLevel | null;
-  score: number;
-  breakdown: ScoreBreakdown;
-  prev7Avg: number | null;
+  summary: DaySummary;
 };
 
 export type EdemaLevel = "없음" | "약함" | "보통" | "심함";
@@ -116,11 +111,14 @@ export const api = {
       body: JSON.stringify({ user_id: userId, seconds }),
     }),
 
-  logMovement: (userId: string, exerciseId: string, durationSec: number, asRecovery = false) =>
-    request<{ todayMovementCount: number; todayMoves: MoveRecord[]; todayRecoveries: RecoveryRecord[]; score: ScoreBreakdown; goal: DailyGoal; continuousSeconds: number }>("/api/movements", {
+  logMovement: (userId: string, exerciseId: string, durationSec: number) =>
+    request<TodayInfo & { todayMovementCount: number; todayMoves: MoveRecord[]; todayRecoveries: RecoveryRecord[]; standing: boolean }>("/api/movements", {
       method: "POST",
-      body: JSON.stringify({ user_id: userId, exerciseId, durationSec, asRecovery }),
+      body: JSON.stringify({ user_id: userId, exerciseId, durationSec }),
     }),
+
+  setToday: (userId: string, patch: { goal?: number | null; plannedSitMin?: number | null }) =>
+    request<Omit<TodayInfo, "history">>(`/api/users/${userId}/today`, { method: "PUT", body: JSON.stringify(patch) }),
 
   getCalendar: (id: string, month: string) =>
     request<{ month: string; days: CalendarDay[] }>(`/api/calendar/${id}?month=${month}`),

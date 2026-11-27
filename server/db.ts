@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import pg from "pg";
-import { scoreDay, dailyGoal, EXERCISE_BY_ID, type BodyProfile, type MoveRecord, type RecoveryRecord, type ScoreBreakdown } from "../shared/scoring";
+import { summarizeDay, goalSuggestion, EXERCISE_BY_ID, type BodyProfile, type DaySummary, type MoveRecord, type PlanSource, type RecoveryRecord } from "../shared/scoring";
 
 // process.cwd() 기준으로 고정 (esbuild로 번들된 뒤에는 import.meta.dirname이
 // dist/ 를 가리켜서, 빌드할 때마다 데이터가 날아갈 수 있기 때문)
@@ -58,7 +58,9 @@ export type DayLog = {
   edema?: EdemaLevel; // 그날 기록한 부종 정도
   bonusPoints?: number; // (예전 점수식) 더 이상 쓰지 않음
   moves?: MoveRecord[]; // 움직임 기록: 어떤 운동을, 몇 초, 직전에 몇 분 앉아 있다가
-  recoveries?: RecoveryRecord[]; // 회복 활동 기록 (D 점수)
+  recoveries?: RecoveryRecord[]; // (예전 형식) 회복 활동 기록 — 지금은 moves에 함께 저장
+  goal?: number; // 사용자가 정한 오늘 일어나기 목표
+  plannedSitMin?: number; // "오늘 몇 시간 앉을 것 같아요?" 답 (분)
 };
 
 // 예전 형식(moves 없이 횟수만)으로 저장된 날은 "30~60분 뒤 1분 가볍게 걷기"로 보수적으로 환산
@@ -67,12 +69,38 @@ function movesOf(log: DayLog): MoveRecord[] {
   return Array.from({ length: log.movementCount }, () => ({ at: "", exerciseId: "walk_easy", durationSec: 60, priorSitSec: 45 * 60 }));
 }
 
-export function scoreOfDay(log: DayLog | undefined, profile?: BodyProfile): ScoreBreakdown {
-  return scoreDay({
-    sitSeconds: log?.totalSeconds ?? 0,
-    moves: log ? movesOf(log) : [],
+/** 그날 일정표에 잡힌 시간(분). 겹치는 일정은 한 번만 센다. */
+export function plannedFromSchedule(userId: string, date: string): number {
+  const day = new Date(date + "T12:00:00+09:00").getUTCDay();
+  const ranges = (db.schedule[userId] ?? [])
+    .filter((b) => (b.date ? b.date === date : b.day === null || b.day === day))
+    .map((b) => [toMinutes(b.start), toMinutes(b.end)] as [number, number])
+    .filter(([a, b]) => b > a)
+    .sort((x, y) => x[0] - y[0]);
+  let total = 0;
+  let curS = -1, curE = -1;
+  for (const [a, b] of ranges) {
+    if (a > curE) { if (curE > curS) total += curE - curS; curS = a; curE = b; }
+    else curE = Math.max(curE, b);
+  }
+  if (curE > curS) total += curE - curS;
+  return total;
+}
+
+/** 오늘 앉을 시간: ① 사용자 답 → ② 일정표 → ③ 없음 */
+function planOf(userId: string, date: string, log?: DayLog): { plannedSitMin: number | null; planSource: PlanSource } {
+  if (log?.plannedSitMin) return { plannedSitMin: log.plannedSitMin, planSource: "self" };
+  const fromSchedule = plannedFromSchedule(userId, date);
+  if (fromSchedule > 0) return { plannedSitMin: fromSchedule, planSource: "timetable" };
+  return { plannedSitMin: null, planSource: "none" };
+}
+
+export function summaryOf(userId: string, date: string, log?: DayLog): DaySummary {
+  return summarizeDay({
+    moves: log?.moves ?? (log ? movesOf(log) : []),
     recoveries: log?.recoveries ?? [],
-    profile,
+    goal: log?.goal ?? null,
+    ...planOf(userId, date, log),
   });
 }
 
@@ -299,10 +327,10 @@ function bumpMaxContinuous(userId: string, dayLog: DayLog) {
 }
 
 /**
- * 움직임 기록. durationSec 동안 운동했으므로, 직전 연속 좌식 시간 = (지금 − 마지막 움직임) − 운동 시간.
- * 회복 활동(category=recovery, 또는 asRecovery=true로 길게 한 숨찬 활동)은 D 점수용으로 따로 쌓는다.
+ * 움직임 기록. 일어나서 한 동작만 연속 좌식을 끝낸다 (앉아서 한 동작은 좌식이 이어짐).
+ * 직전 연속 좌식 시간(추정) = (지금 − 마지막 기립) − 운동 시간.
  */
-export function markMoved(userId: string, exerciseId: string, durationSec: number, asRecovery = false) {
+export function markMoved(userId: string, exerciseId: string, durationSec: number) {
   const ex = EXERCISE_BY_ID[exerciseId];
   if (!ex) return null;
   const date = todayIso();
@@ -312,19 +340,37 @@ export function markMoved(userId: string, exerciseId: string, durationSec: numbe
   const trackingOn = db.users[userId]?.trackingEnabled !== false;
   const last = db.state[userId]?.lastMovedAt;
   const sinceLast = last ? Math.max(0, Math.round((Date.now() - new Date(last).getTime()) / 1000)) : 0;
-  const priorSitSec = trackingOn ? Math.max(0, sinceLast - dur) : 0;
-  if (trackingOn && priorSitSec > (dayLog.maxContinuousSeconds ?? 0)) dayLog.maxContinuousSeconds = priorSitSec;
-  db.state[userId] = { lastMovedAt: new Date().toISOString() };
-  const at = new Date().toISOString();
-  if (ex.category === "recovery" || asRecovery) {
-    (dayLog.recoveries ??= []).push({ at, exerciseId, durationSec: dur });
-  } else {
-    if (!dayLog.moves) dayLog.moves = movesOf(dayLog).slice(); // 예전 기록이 있으면 형식 변환
-    dayLog.moves.push({ at, exerciseId, durationSec: dur, priorSitSec });
-    dayLog.movementCount += 1;
+  const standing = ex.category !== "seated";
+  const priorSitSec = trackingOn ? Math.max(0, sinceLast - (standing ? dur : 0)) : 0;
+  if (standing) {
+    if (trackingOn && priorSitSec > (dayLog.maxContinuousSeconds ?? 0)) dayLog.maxContinuousSeconds = priorSitSec;
+    db.state[userId] = { lastMovedAt: new Date().toISOString() };
   }
+  if (!dayLog.moves) dayLog.moves = movesOf(dayLog).slice(); // 예전 기록이 있으면 형식 변환
+  dayLog.moves.push({ at: new Date().toISOString(), exerciseId, durationSec: dur, priorSitSec });
+  dayLog.movementCount += 1;
   save(db);
   return dayLog;
+}
+
+/** 오늘 목표·예정 앉은 시간 설정. null이면 지움 */
+export function setTodayPlan(userId: string, patch: { goal?: number | null; plannedSitMin?: number | null }) {
+  const userLog = (db.sitting[userId] ??= {});
+  const dayLog = (userLog[todayIso()] ??= { totalSeconds: 0, movementCount: 0 });
+  if (patch.goal !== undefined) { if (patch.goal === null) delete dayLog.goal; else dayLog.goal = patch.goal; }
+  if (patch.plannedSitMin !== undefined) { if (patch.plannedSitMin === null) delete dayLog.plannedSitMin; else dayLog.plannedSitMin = patch.plannedSitMin; }
+  save(db);
+  return dayLog;
+}
+
+/** 최근 14일 동안 운동별 완료 횟수 (추천 순서용) */
+export function moveHistory(userId: string): Record<string, number> {
+  const logs = db.sitting[userId] ?? {};
+  const out: Record<string, number> = {};
+  for (const d of [todayIso(), ...pastDates(todayIso(), 13)]) {
+    for (const m of logs[d]?.moves ?? []) out[m.exerciseId] = (out[m.exerciseId] ?? 0) + 1;
+  }
+  return out;
 }
 
 export function addHeartbeatSeconds(userId: string, seconds: number) {
@@ -349,9 +395,7 @@ export function getMonthLog(userId: string, month: string) {
       movementCount: log.movementCount,
       maxContinuousSeconds: log.maxContinuousSeconds ?? 0,
       edema: log.edema ?? null,
-      score: scoreOfDay(log, db.users[userId]?.profile).total,
-      breakdown: scoreOfDay(log, db.users[userId]?.profile),
-      prev7Avg: prev7AvgScore(logs, date, db.users[userId]?.profile),
+      summary: summaryOf(userId, date, log),
     }));
 }
 
@@ -366,19 +410,27 @@ function pastDates(date: string, days: number) {
 
 const hasRecord = (l?: DayLog) => !!l && (l.movementCount > 0 || l.totalSeconds > 0 || (l.recoveries?.length ?? 0) > 0);
 
-// 해당 날짜 직전 7일 중 기록이 있는 날들의 평균 점수 (없으면 null)
-function prev7AvgScore(logs: Record<string, DayLog>, date: string, profile?: BodyProfile) {
-  const scores = pastDates(date, 7).map((d) => logs[d]).filter(hasRecord).map((l) => scoreOfDay(l, profile).total);
-  return scores.length ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10 : null;
+/** 오늘 요약 + 목표 올리기 제안 (최근 7일 중 기록 있는 날이 5일 이상이고 모두 달성했을 때) */
+export function getToday(userId: string) {
+  const logs = db.sitting[userId] ?? {};
+  const today = summaryOf(userId, todayIso(), logs[todayIso()]);
+  const past = pastDates(todayIso(), 7).filter((d) => hasRecord(logs[d])).map((d) => summaryOf(userId, d, logs[d]));
+  return { summary: today, suggestGoal: goalSuggestion(past, today), streak: streakOf(userId) };
 }
 
-/** 나의 목표: 최근 7일 기록의 "끊기 인정 횟수" 평균에서 15% 올린 값 */
-export function getDailyGoal(userId: string) {
+/** 일어나기 목표를 연속으로 달성한 날 수 (오늘 달성 전이면 어제까지). 하루 빠진 날은 건너뛰고 끊지 않음 (Lally 2010) */
+function streakOf(userId: string) {
   const logs = db.sitting[userId] ?? {};
-  const profile = db.users[userId]?.profile;
-  const past = pastDates(todayIso(), 7).map((d) => logs[d]).filter(hasRecord).map((l) => scoreOfDay(l, profile).credited1);
-  const today = scoreOfDay(logs[todayIso()], profile);
-  return { ...dailyGoal(past, today.targetBreaks), todayCredited: today.credited1 };
+  let streak = 0;
+  let misses = 0;
+  const todayDone = summaryOf(userId, todayIso(), logs[todayIso()]).standDone;
+  if (todayDone) streak += 1;
+  for (const d of pastDates(todayIso(), 60)) {
+    if (!hasRecord(logs[d])) break;
+    if (summaryOf(userId, d, logs[d]).standDone) streak += 1;
+    else if (++misses > 1) break; // 한 번 빠진 건 봐줌
+  }
+  return streak;
 }
 
 export function getTodayLog(userId: string): DayLog {

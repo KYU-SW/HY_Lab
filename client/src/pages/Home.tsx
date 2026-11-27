@@ -6,16 +6,22 @@ import {
   RECOMMENDED_SEC,
   CATEGORY_LABEL,
   BAND_LABEL,
-  MAX_COUNTED_SEC,
+  ACTIVITY_LABEL,
+  LIMITATION_LABEL,
+  PLACE_LABEL,
+  STAND_DEDUPE_MIN,
   bandOf,
   kcalOf,
-  metCorrection,
-  scoreDay,
+  recommend,
+  summarizeDay,
+  type ActivityLevel,
   type BodyProfile,
+  type DaySummary,
   type ExerciseCategory,
+  type Limitation,
   type MoveRecord,
+  type Place,
   type RecoveryRecord,
-  type ScoreBreakdown,
 } from "@shared/scoring";
 import {
   ArrowLeft,
@@ -53,9 +59,10 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, ApiError, type CalendarDay, type DailyGoal, type Dashboard, type EdemaLevel, type PeriodStat, type ReminderTime, type ScheduleBlock, type SessionUser } from "@/lib/api";
+import { api, ApiError, type CalendarDay, type Dashboard, type TodayInfo, type EdemaLevel, type PeriodStat, type ReminderTime, type ScheduleBlock, type SessionUser } from "@/lib/api";
 import { clearSession, loadSession, saveSession } from "@/lib/session";
 import { TimetableScreen, type ClassDraft } from "@/pages/Timetable";
+import { BODY_BASE, BODY_BACK, BODY_FRONT, type BodyShape } from "@/lib/bodyShapes";
 import { GpsClassifier, MOTION, StepDetector, type MotionState } from "@/lib/motion";
 
 type Screen =
@@ -90,11 +97,11 @@ const navItems: NavItem[] = [
 const WEEKDAY_LABEL = ["일", "월", "화", "수", "목", "금", "토"];
 const BREAK_INTERVAL_OPTIONS = [20, 30, 45, 60];
 
-// ---- 점수 규칙은 shared/scoring.ts (최종안 v2) ----
+// ---- 실천 기록 규칙은 shared/scoring.ts (확정안 v4) ----
 const ZONE_NOTICE_MIN = 30; // 안전 ~30분 / 주의 30~60분 / 위험 60분 이상
 const ZONE_RISK_MIN = 60;
-const EMPTY_SCORE: ScoreBreakdown = scoreDay({ sitSeconds: 0, moves: [] });
-const GRADE_CLASS: Record<string, string> = { "아주 좋음": "g1", 좋음: "g2", 주의: "g3", 위험: "g4" };
+const EMPTY_TODAY: TodayInfo = { summary: summarizeDay({ moves: [], plannedSitMin: null, planSource: "none" }), suggestGoal: null, streak: 0, history: {} };
+const PLAN_HOURS = [2, 4, 6, 8, 10];
 
 // ---- GPS 자동 감지 규칙 (판별 기준은 lib/motion.ts) ----
 const GPS_STILL_HOLD_SEC = 120; // 걷기가 이 시간 동안 없으면 "앉아 계신가요?" 질문
@@ -137,9 +144,9 @@ const movementCards: Record<MoveMode, { title: string; copy: string; categories:
     accent: "lime",
   },
   recovery: {
-    title: "회복 활동",
-    copy: "숨이 조금 차는 활동을 길게 하면\n오늘 깎인 점수를 되찾아요.",
-    categories: ["recovery", "vigorous"],
+    title: "제대로 운동하기",
+    copy: "시간이 있을 때\n숨이 찰 만큼 움직여요.",
+    categories: ["vigorous", "recovery"],
     icon: HeartPulse,
     accent: "lime",
   },
@@ -414,33 +421,39 @@ function AuthScreen({
 
 function EyeIcon() { return <span className="eye-icon">◉</span>; }
 
-const SCORE_PARTS: { key: "a1" | "a2" | "b" | "c"; label: string; max: number; hint: string }[] = [
-  { key: "a1", label: "자주 끊기", max: 25, hint: "30분 안에 끊기 (앉아서 동작 포함)" },
-  { key: "a2", label: "일어나서 끊기", max: 25, hint: "30분 안에 일어나서 움직이기" },
-  { key: "b", label: "움직인 양", max: 30, hint: "일어나서 움직인 시간" },
-  { key: "c", label: "앉은 시간", max: 20, hint: "7시간 이하면 만점" },
-];
-
-function ScoreCard({ score, goal, compact = false }: { score: ScoreBreakdown; goal?: DailyGoal | null; compact?: boolean }) {
+function GoalCard({ today, onSetGoal, onSetPlanned }: { today: TodayInfo; onSetGoal: (goal: number) => void; onSetPlanned: (min: number | null) => void }) {
   const [open, setOpen] = useState(false);
+  const t = today.summary;
+  const standPct = Math.min(100, (t.standCount / t.goal) * 100);
+  const planText = t.plannedSitMin
+    ? `${t.planSource === "timetable" ? "일정표 기준" : "내가 정한"} 오늘 앉을 시간 ${Math.round((t.plannedSitMin / 60) * 10) / 10}시간`
+    : "오늘 앉을 시간을 알려주면 목표 범위를 정해드려요";
   return (
-    <section className={`score-card ${compact ? "score-card--compact" : ""}`} onClick={() => setOpen((v) => !v)}>
+    <section className="score-card goal-card">
       <div className="score-card-top">
-        <div><span className="section-kicker">TODAY SCORE</span><div className="score-total"><strong>{score.total}</strong><span>/ 100</span></div></div>
-        {score.enoughData ? <span className={`grade-chip grade-chip--${GRADE_CLASS[score.grade]}`}>{score.grade}</span> : <span className="grade-chip grade-chip--wait">측정 중</span>}
+        <div><span className="section-kicker">TODAY GOAL</span><h3 className="goal-title">오늘의 실천</h3></div>
+        {today.streak > 0 && <span className="grade-chip grade-chip--g2">🔥 {today.streak}일 연속</span>}
       </div>
-      <div className="score-parts">
-        {SCORE_PARTS.map((p) => (
-          <div key={p.key} className="score-part"><div className="score-part-head"><span>{p.label}</span><b>{score[p.key]}<small>/{p.max}</small></b></div><div className="score-bar"><i style={{ width: `${(score[p.key] / p.max) * 100}%` }} /></div></div>
-        ))}
+      <div className="goal-row">
+        <div className="score-part-head"><span>일어나기</span><b>{t.standCount}<small> / {t.goal}회</small>{t.standDone && " ✓"}</b></div>
+        <div className="score-bar"><i style={{ width: `${standPct}%` }} /></div>
+        <div className="goal-stepper">
+          <button disabled={t.goal <= t.goalMin} onClick={() => onSetGoal(t.goal - 1)} aria-label="목표 줄이기">−</button>
+          <span>목표 {t.goal}회{t.goalRec != null ? ` · 권장 ${t.goalRec}회 · 최소 ${t.goalMin}회` : ""}</span>
+          <button disabled={t.goal >= 48} onClick={() => onSetGoal(t.goal + 1)} aria-label="목표 늘리기">+</button>
+        </div>
       </div>
-      {(score.d > 0 || score.bonus > 0) && <div className="score-extra">{score.d > 0 && <span>회복 +{score.d}</span>}{score.bonus > 0 && <span>계단·숨찬 활동 보너스 +{score.bonus}</span>}</div>}
-      {goal && <div className="score-goal">{goal.measuring ? <span>나의 목표: 기준선 측정 중 ({goal.daysCollected}/3일)</span> : <span>나의 목표: 30분 안에 끊기 <b>{Math.floor(goal.todayCredited)}</b> / {goal.goal}번 <small>(지난 기록 평균 {goal.baseline}번 + 15%)</small></span>}</div>}
-      {!score.enoughData && <p className="score-note"><Info size={12} /> 앉은 기록이 1시간 미만이라 등급은 아직 측정 중이에요.</p>}
+      {today.suggestGoal != null && <button className="goal-suggest" onClick={() => onSetGoal(today.suggestGoal!)}><Sparkles size={13} /> 최근 계속 달성했어요. 목표를 {today.suggestGoal}회로 올려볼까요?</button>}
+      <div className="goal-plan">
+        <span>{planText}</span>
+        <div className="action-chips action-chips--wrap">{PLAN_HOURS.map((h) => <button key={h} className={t.planSource === "self" && t.plannedSitMin === h * 60 ? "is-on" : ""} onClick={() => onSetPlanned(t.planSource === "self" && t.plannedSitMin === h * 60 ? null : h * 60)}>{h}시간</button>)}</div>
+      </div>
+      <button className="goal-more" onClick={() => setOpen((v) => !v)}>{open ? "접기" : "어떻게 세나요?"}</button>
       {open && <div className="score-detail">
-        <p>오늘 목표 끊기 {score.targetBreaks}번 (앉은 시간을 30분으로 나눈 값) · 자주 끊기 인정 {score.credited1}번 · 일어나서 끊기 인정 {score.credited2}번</p>
-        <p>일어나서 움직인 시간 {score.activeMin}분 · 회복 활동 {score.recoveryMin}분 · 강도 계산 정확도 {score.accuracy}</p>
-        <p className="score-detail-src">30분 안에 끊으면 1회, 30~60분 0.6회(일어나서 끊기는 0.3회), 60분 넘으면 0.25회(일어나서 끊기는 0회)로 인정해요. 앉아서 하는 동작은 자주 끊기 점수만 받아요. 이 점수는 측정값이 아니라 행동 점수예요.</p>
+        <p>앉아서 한 동작 {t.seatedCount}회 · 전체 실천 {t.totalCount}회 · 숨이 찬 운동 {Math.floor(t.activeMin)}분 (기록용)</p>
+        <p>일어나기 목표는 앉을 시간 ÷ 30분이 권장, ÷ 60분(수업 하나마다 한 번)이 최소예요. 같은 {STAND_DEDUPE_MIN}분 안에 다시 일어나면 횟수는 한 번만 세요.</p>
+        <p>앉아서 하는 동작은 앉은 채라 일어나기 횟수에는 넣지 않고 기록만 해요.</p>
+        <p className="score-detail-src">이 숫자는 건강 수치가 아니라 오늘 내가 실천한 기록이에요.</p>
       </div>}
     </section>
   );
@@ -451,8 +464,9 @@ function HomeScreen({
   continuousSeconds,
   todaySeconds,
   movementCount,
-  score,
-  goal,
+  today: todayInfo,
+  onSetGoal,
+  onSetPlanned,
   zone,
   trackingOn,
   autoPaused,
@@ -464,8 +478,9 @@ function HomeScreen({
   continuousSeconds: number;
   todaySeconds: number;
   movementCount: number;
-  score: ScoreBreakdown;
-  goal: DailyGoal | null;
+  today: TodayInfo;
+  onSetGoal: (goal: number) => void;
+  onSetPlanned: (min: number | null) => void;
   zone: { level: RiskLevel; label: string };
   trackingOn: boolean;
   autoPaused: boolean;
@@ -479,19 +494,19 @@ function HomeScreen({
     <div className="screen app-screen home-screen">
       <StatusBar />
       <div className="app-header"><div><span className="date-label">{new Date().toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "long" })}</span><h2>좋은 하루예요, {user.nickname}님 <span>✦</span></h2></div><button className="avatar-button">{user.nickname.slice(0, 1)}</button></div>
-      <ScoreCard score={score} goal={goal} />
+      <GoalCard today={todayInfo} onSetGoal={onSetGoal} onSetPlanned={onSetPlanned} />
       <section className={`gauge-card ${trackingOn ? "" : "is-paused"}`}>
         <div className="gauge-card-top"><span className="section-kicker">CURRENT RHYTHM</span></div>
         <div className="gauge-area">
           <div className="gauge-arc"><div className="gauge-arc-inner" /><div className="gauge-needle" style={{ transform: `rotate(${needleRotate}deg)` }} /></div>
-          <div className="gauge-center"><span>연속 좌식 시간</span><strong>{formatClock(continuousSeconds)}</strong><small><i className={`zone-dot zone-dot--${trackingOn ? zone.level : "off"}`} /> {trackingOn ? zone.label : "기록 꺼짐"}</small></div>
+          <div className="gauge-center"><span>연속 좌식 시간 (추정)</span><strong>{formatClock(continuousSeconds)}</strong><small><i className={`zone-dot zone-dot--${trackingOn ? zone.level : "off"}`} /> {trackingOn ? zone.label : "기록 꺼짐"}</small></div>
         </div>
         <div className="gauge-legend"><span className={trackingOn && zone.level === "safe" ? "is-active" : ""}><i className="legend-dot legend-dot--safe" /> 편안함</span><span className={trackingOn && zone.level === "notice" ? "is-active" : ""}><i className="legend-dot legend-dot--notice" /> 잠깐 전환</span><span className={trackingOn && zone.level === "risk" ? "is-active" : ""}><i className="legend-dot legend-dot--risk" /> 오래 앉음</span></div>
         <div className="tracking-row"><div><strong>좌식 타이머</strong><small>{trackingOn ? "앉은 시간을 기록하고 알려드려요" : autoPaused ? "움직임이 감지돼 잠시 멈췄어요 · 멈추면 물어볼게요" : "꺼져 있어요 · 기록·알림이 멈춰요"}</small></div><button className={`toggle ${trackingOn ? "is-on" : ""}`} onClick={onToggleTracking} aria-label="좌식 타이머 켜기/끄기"><span /></button></div>
       </section>
       <section className="stat-grid">
-        <div className="stat-card"><div className="stat-card-top"><span>오늘 총 좌식시간</span><Clock3 size={16} /></div><strong>{String(today.h).padStart(2, "0")}<span>h</span> {String(today.m).padStart(2, "0")}<span>m</span></strong><small>{user.breakIntervalMin}분마다 한 번씩 움직이면 좋아요</small></div>
-        <div className="stat-card"><div className="stat-card-top"><span>움직임 실현 횟수</span><Footprints size={16} /></div><strong>{String(movementCount).padStart(2, "0")}<span>회</span></strong><small>오늘 기록된 횟수예요</small></div>
+        <div className="stat-card"><div className="stat-card-top"><span>오늘 좌식시간 (추정)</span><Clock3 size={16} /></div><strong>{String(today.h).padStart(2, "0")}<span>h</span> {String(today.m).padStart(2, "0")}<span>m</span></strong><small>{user.breakIntervalMin}분마다 한 번씩 움직이면 좋아요</small></div>
+        <div className="stat-card"><div className="stat-card-top"><span>전체 실천 횟수</span><Footprints size={16} /></div><strong>{String(movementCount).padStart(2, "0")}<span>회</span></strong><small>앉아서 한 동작까지 모두 센 기록이에요</small></div>
       </section>
       <button className="primary-button move-cta" onClick={onMove}><span className="cta-icon"><Zap size={17} fill="currentColor" /></span>지금 바로 움직이기<ArrowRight size={17} /></button>
       <BottomNav current="home" onNavigate={onNavigate} />
@@ -504,77 +519,86 @@ function BottomNav({ current, onNavigate }: { current: NavItem["id"]; onNavigate
 }
 
 function MoveSheet({ onClose, onSelect }: { onClose: () => void; onSelect: (mode: MoveMode) => void }) {
-  return <div className="sheet-backdrop" onClick={onClose}><div className="move-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-heading"><div><span className="section-kicker">ONE SMALL SHIFT</span><h2>지금, 어떤 게 가능해요?</h2><p>지금의 상황에 맞는 움직임을 골라주세요.</p></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="move-options"><button onClick={() => onSelect("seated")}><span className="move-option-icon move-option-icon--mint"><Footprints size={22} /></span><span><strong>지금 못 일어나요</strong><small>앉은 채로 1분, 다리 깨우기 (자주 끊기 점수)</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("standing")}><span className="move-option-icon move-option-icon--lime"><MoveUpRight size={22} /></span><span><strong>일어날 수 있어요</strong><small>걷기 · 제자리 근력 · 계단 (끊기 점수 둘 다)</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("recovery")}><span className="move-option-icon move-option-icon--lime"><HeartPulse size={22} /></span><span><strong>운동·회복 활동</strong><small>조깅·자전거·빠르게 걷기를 길게 (깎인 점수 회복)</small></span><ChevronRight size={18} /></button></div><p className="sheet-footnote"><ShieldCheck size={14} /> 무리하지 않고 지금 가능한 만큼만 해요.</p></div></div>;
+  return <div className="sheet-backdrop" onClick={onClose}><div className="move-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-heading"><div><span className="section-kicker">ONE SMALL SHIFT</span><h2>지금, 어떤 게 가능해요?</h2><p>지금의 상황에 맞는 움직임을 골라주세요.</p></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="move-options"><button onClick={() => onSelect("seated")}><span className="move-option-icon move-option-icon--mint"><Footprints size={22} /></span><span><strong>지금 못 일어나요</strong><small>앉은 채로 1분, 다리 깨우기 (기록만, 일어나기 횟수 X)</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("standing")}><span className="move-option-icon move-option-icon--lime"><MoveUpRight size={22} /></span><span><strong>일어날 수 있어요</strong><small>걷기 · 제자리 근력 · 계단 (일어나기 +1)</small></span><ChevronRight size={18} /></button><button onClick={() => onSelect("recovery")}><span className="move-option-icon move-option-icon--lime"><HeartPulse size={22} /></span><span><strong>제대로 운동하기</strong><small>계단·버피·조깅처럼 시간 있을 때 제대로 (일어나기 +1)</small></span><ChevronRight size={18} /></button></div><p className="sheet-footnote"><ShieldCheck size={14} /> 무리하지 않고 지금 가능한 만큼만 해요.</p></div></div>;
 }
 
 function TimerScreen({
   mode,
-  todaySeconds,
-  continuousSeconds,
   moves,
   recoveries,
+  today,
   profile,
+  quiet,
   onComplete,
+  onExclude,
   onBack,
 }: {
   mode: MoveMode;
-  todaySeconds: number;
-  continuousSeconds: number;
   moves: MoveRecord[];
   recoveries: RecoveryRecord[];
+  today: TodayInfo;
   profile: BodyProfile;
-  onComplete: (exerciseId: string, durationSec: number, asRecovery: boolean) => void;
+  quiet: boolean;
+  onComplete: (exerciseId: string, durationSec: number) => void;
+  onExclude: (exerciseId: string) => void;
   onBack: () => void;
 }) {
   const movement = movementCards[mode];
-  const options = useMemo(() => EXERCISES.filter((e) => movement.categories.includes(e.category)), [movement]);
-  const [exerciseId, setExerciseId] = useState(options[0]?.id ?? "walk_easy");
-  const ex = EXERCISE_BY_ID[exerciseId];
-  const isRecovery = mode === "recovery";
-  const required = isRecovery ? RECOMMENDED_SEC.recovery : RECOMMENDED_SEC[ex.category];
+  const isActive = mode === "recovery";
+  const [place, setPlace] = useState<Place>(quiet ? "class" : isActive ? "outdoor" : "home");
+  const [availableMin, setAvailableMin] = useState(isActive ? 10 : 3);
+  const rec = useMemo(
+    () => recommend({ categories: movement.categories, place, availableMin, profile, history: today.history }),
+    [movement, place, availableMin, profile, today.history],
+  );
+  const [picked, setPicked] = useState<string | null>(null);
+  const exerciseId = picked && rec.list.some((r) => r.id === picked) ? picked : rec.list[0]?.id ?? null;
+  const [showHidden, setShowHidden] = useState(false);
+  const ex = exerciseId ? EXERCISE_BY_ID[exerciseId] : null;
+  const required = ex ? RECOMMENDED_SEC[ex.category] : 60;
   const [elapsed, setElapsed] = useState(0);
-  const [priorSit] = useState(continuousSeconds); // 이 동작 직전 연속 좌식 시간
   useEffect(() => { const timer = window.setInterval(() => setElapsed((value) => value + 1), 1000); return () => window.clearInterval(timer); }, []);
   const done = elapsed >= required;
   const progress = Math.min(1, elapsed / required);
   const shown = done ? elapsed - required : required - elapsed;
-  const mm = Math.floor(shown / 60);
-  const fmt = `${String(mm).padStart(2, "0")}:${String(shown % 60).padStart(2, "0")}`;
+  const fmt = `${String(Math.floor(shown / 60)).padStart(2, "0")}:${String(shown % 60).padStart(2, "0")}`;
   const Icon = movement.icon;
-  const { factor, accuracy } = metCorrection(profile);
-  const met = Math.round(ex.met * factor * 10) / 10;
-  const band = bandOf(met);
-  const kcal = kcalOf(exerciseId, elapsed, profile);
+  const band = ex ? bandOf(ex.met) : "light";
+  const kcal = ex ? kcalOf(ex.id, elapsed, profile) : null;
 
-  const before = useMemo(() => scoreDay({ sitSeconds: todaySeconds, moves, recoveries, profile }), [todaySeconds, moves, recoveries, profile]);
-  const after = scoreDay({
-    sitSeconds: todaySeconds,
-    moves: isRecovery ? moves : [...moves, { at: "", exerciseId, durationSec: elapsed, priorSitSec: priorSit }],
-    recoveries: isRecovery ? [...recoveries, { at: "", exerciseId, durationSec: elapsed }] : recoveries,
-    profile,
-  });
-  const gain = Math.round((after.total - before.total) * 10) / 10;
-  const capped = !isRecovery && elapsed >= MAX_COUNTED_SEC;
-  const groups = movement.categories.map((c) => ({ c, items: options.filter((o) => o.category === c) })).filter((g) => g.items.length);
-  const priorMin = Math.round(priorSit / 60);
-  const recoverable = 20 - before.c + 0.5 * (50 - before.a1 - before.a2);
-  const breakNote = isRecovery
-    ? recoverable < 0.5 ? "지금은 깎인 점수가 없어서 회복할 게 없어요. 많이 앉은 날 해두면 점수를 되찾아요."
-      : met < 3 ? "이 강도로는 회복으로 인정되지 않아요 (중간 강도 이상)."
-      : `회복 가능한 점수 ${Math.round(recoverable * 10) / 10}점 중 60분이면 전부 되찾아요.`
-    : priorMin <= 30 ? `${priorMin}분 앉은 뒤 끊었어요 · 30분 이내라 1회로 인정`
-    : priorMin <= 60 ? `${priorMin}분 앉은 뒤 끊었어요 · 자주 끊기 0.6회, 일어나서 끊기 0.3회로 인정`
-    : `${priorMin}분 앉은 뒤 끊었어요 · 자주 끊기 0.25회만 인정 (다음엔 30분 안에!)`;
+  const before = today.summary;
+  const after = ex ? summarizeDay({
+    moves: [...moves, { at: new Date().toISOString(), exerciseId: ex.id, durationSec: elapsed, priorSitSec: 0 }],
+    recoveries,
+    plannedSitMin: before.plannedSitMin,
+    planSource: before.planSource,
+    goal: before.goal,
+  }) : before;
+  const reason = ex ? rec.list.find((r) => r.id === ex.id)?.reason : "";
+  const standNote = !ex ? "" : ex.category === "seated"
+    ? "앉아서 하는 동작은 일어나기 횟수에 들어가지 않아요 (기록만)"
+    : after.standCount > before.standCount
+      ? `${before.standCount} → ${after.standCount} / ${before.goal}회`
+      : `${STAND_DEDUPE_MIN}분 안에 이미 일어나서 횟수는 그대로예요`;
 
   return <div className="screen app-screen timer-screen"><StatusBar />
-    <div className="timer-header"><button className="icon-button" onClick={onBack}><ArrowLeft size={19} /></button><span>{isRecovery ? "회복 활동 타이머" : "움직임 타이머"}</span><button className="icon-button"><CircleHelp size={18} /></button></div>
+    <div className="timer-header"><button className="icon-button" onClick={onBack}><ArrowLeft size={19} /></button><span>움직임 타이머</span><button className="icon-button"><CircleHelp size={18} /></button></div>
     <div className="timer-intro"><span className="section-kicker">RIGHT NOW</span><h2>{movement.title}</h2><p>{movement.copy.split("\n").map((line) => <span key={line}>{line}</span>)}</p></div>
-    <div className={`timer-circle timer-circle--${movement.accent}`} style={{ "--progress": `${progress * 360}deg` } as React.CSSProperties}><div className="timer-circle-inner"><span>{done ? (isRecovery ? "권장 시간 달성 · 계속하면 더 회복" : "권장 시간 달성 · 추가 운동 +") : "권장 시간까지"}</span><strong>{fmt}</strong><small><i /> {capped ? "한 번에 5분까지 인정돼요" : done ? "계속하면 점수가 더 올라가요" : "천천히 따라 해보세요"}</small></div></div>
-    <div className="gain-card"><div className="gain-head"><span>오늘 점수</span><strong>{before.total} → {after.total} <em>{gain > 0 ? `+${gain}` : ""}</em></strong></div><div className="gain-bar"><i style={{ width: `${Math.min(100, after.total)}%` }} /></div><small>{breakNote}</small></div>
-    <div className="movement-detail-card"><div className={`movement-detail-icon movement-detail-icon--${movement.accent}`}><Icon size={23} /></div><div><span>{CATEGORY_LABEL[ex.category]} · 권장 {Math.round(required / 60)}분 · {ex.category === "seated" ? "자주 끊기 점수" : `${BAND_LABEL[band]} 강도 ${met} MET`}{kcal != null && elapsed > 0 ? ` · 약 ${kcal}kcal` : ""}</span><strong>{ex.name}</strong><p>{ex.desc}</p></div></div>
-    <div className="exercise-picker">{groups.map((g) => <div key={g.c} className="exercise-group"><span className="exercise-group-label">{CATEGORY_LABEL[g.c]}</span><div className="action-chips action-chips--wrap">{g.items.map((o) => <button key={o.id} className={o.id === exerciseId ? "is-on" : ""} onClick={() => setExerciseId(o.id)}>{o.name}</button>)}</div></div>)}</div>
-    <div className="timer-actions"><button className="secondary-button" onClick={onBack}><RotateCcw size={16} /> 다시 고르기</button><button className="primary-button" disabled={elapsed < 10} onClick={() => onComplete(exerciseId, elapsed, isRecovery)}><Check size={17} /> 완료했어요</button></div>
-    <p className="medical-note"><Info size={13} /> 운동 강도는 2024 신체활동 강도 목록(Compendium) 값{accuracy === "기본" ? "" : `을 내 몸 정보로 보정한 추정값(정확도 ${accuracy})`}이에요. 통증이 있다면 멈추고 전문가와 상담하세요.</p>
+    <div className="context-picker">
+      <div><span className="exercise-group-label">지금 어디예요?</span><div className="action-chips action-chips--wrap">{(Object.keys(PLACE_LABEL) as Place[]).map((pl) => <button key={pl} className={pl === place ? "is-on" : ""} onClick={() => setPlace(pl)}>{PLACE_LABEL[pl]}</button>)}</div></div>
+      <div><span className="exercise-group-label">시간은?</span><div className="action-chips action-chips--wrap">{[1, 3, 10].map((m) => <button key={m} className={m === availableMin ? "is-on" : ""} onClick={() => setAvailableMin(m)}>{m}분{m === 10 ? " 이상" : ""}</button>)}</div></div>
+    </div>
+    {ex ? <>
+      <div className={`timer-circle timer-circle--${movement.accent}`} style={{ "--progress": `${progress * 360}deg` } as React.CSSProperties}><div className="timer-circle-inner"><span>{done ? "권장 시간 달성 · 계속해도 좋아요" : "권장 시간까지"}</span><strong>{fmt}</strong><small><i /> {done ? "더 해도 좋아요" : "천천히 따라 해보세요"}</small></div></div>
+      <div className="gain-card gain-card--rows"><div className="gain-head"><span>일어나기</span><strong>{standNote}</strong></div></div>
+      <div className="movement-detail-card"><div className={`movement-detail-icon movement-detail-icon--${movement.accent}`}><Icon size={23} /></div><div><span>{CATEGORY_LABEL[ex.category]} · 권장 {Math.round(required / 60)}분 · {BAND_LABEL[band]} {ex.met} MET{kcal != null && elapsed > 0 ? ` · 약 ${kcal}kcal` : ""}</span><strong>{ex.name}</strong><p>{ex.desc}</p>{reason && <p className="rec-reason"><Sparkles size={12} /> 추천 이유: {reason}</p>}<button className="rec-exclude" onClick={() => { onExclude(ex.id); setPicked(null); }}>이 운동은 추천에서 빼기</button></div></div>
+    </> : <div className="gain-card"><small>지금 조건에서 할 수 있는 운동이 없어요. 장소나 시간을 바꿔보세요.</small></div>}
+    <div className="exercise-picker"><div className="exercise-group"><span className="exercise-group-label">나에게 맞는 순서</span><div className="action-chips action-chips--wrap">{rec.list.map((o, i) => <button key={o.id} className={o.id === exerciseId ? "is-on" : ""} onClick={() => setPicked(o.id)}>{i === 0 ? "★ " : ""}{EXERCISE_BY_ID[o.id].name}</button>)}</div></div>
+      {rec.hidden.length > 0 && <button className="goal-more" onClick={() => setShowHidden((v) => !v)}>{showHidden ? "접기" : `지금 추천하지 않는 운동 ${rec.hidden.length}개`}</button>}
+      {showHidden && <ul className="rec-hidden">{rec.hidden.map((h) => <li key={h.id}>{EXERCISE_BY_ID[h.id].name} · {h.reason}</li>)}</ul>}
+    </div>
+    <div className="timer-actions"><button className="secondary-button" onClick={onBack}><RotateCcw size={16} /> 다시 고르기</button><button className="primary-button" disabled={!ex || elapsed < 10} onClick={() => ex && onComplete(ex.id, elapsed)}><Check size={17} /> 완료했어요</button></div>
+    <p className="medical-note"><Info size={13} /> 강도는 2024 신체활동 강도 목록(Compendium) 값이에요. 추천은 내 몸 정보·평소 운동 수준·불편한 부위·최근 기록으로 순서를 정해요. 통증이 있다면 멈추고 전문가와 상담하세요.</p>
   </div>;
 }
 
@@ -637,11 +661,10 @@ function CalendarScreen({ userId, onNavigate }: { userId: string; onNavigate: (n
   };
   const selectedDay = Number(selectedDate.slice(8, 10));
   const selectedMonthLabel = Number(selectedDate.slice(5, 7));
-  const activity = selected?.score ?? 0;
-  const bd = selected?.breakdown;
-  const delta = selected && selected.prev7Avg != null ? Math.round((activity - selected.prev7Avg) * 10) / 10 : null;
+  const sm = selected?.summary;
+  const doneDays = Object.values(records).filter((r) => r.summary?.standDone).length;
 
-  return <div className="screen app-screen calendar-screen"><StatusBar /><div className="page-header"><div><span className="section-kicker">YOUR RECORD</span><h2>캘린더</h2></div><button className="icon-button" onClick={() => { setYear(Number(todayIso.slice(0, 4))); setMonth(Number(todayIso.slice(5, 7))); setSelectedDate(todayIso); }}><MoreHorizontal size={19} /></button></div><div className="calendar-summary"><div className="calendar-summary-icon"><CalendarDays size={17} /></div><div><strong>이번 달의 리듬</strong><span>{loading ? "불러오는 중..." : `${recordedDays}일 동안 기록했어요`}</span></div><div className="calendar-summary-score">{totalMovements}<span>회</span></div></div><div className="month-switcher"><button onClick={() => moveMonth(-1)}><ChevronLeft size={18} /></button><strong>{year}년 {month}월</strong><button onClick={() => moveMonth(1)} disabled={isCurrentMonth} style={isCurrentMonth ? { opacity: 0.3 } : undefined}><ChevronRight size={18} /></button></div><div className="calendar-weekdays">{WEEKDAY_LABEL.map((day) => <span key={day}>{day}</span>)}</div><div className="calendar-grid">{Array.from({ length: firstWeekday }, (_, i) => <span key={`pad-${i}`} />)}{days.map((day) => { const date = dateOf(day); const rec = records[date]; const ring = rec ? (rec.score ?? 0) : 0; const hasRecord = !!rec && (rec.totalSeconds > 0 || rec.movementCount > 0); return <button key={day} onClick={() => setSelectedDate(date)} disabled={date > todayIso} style={date > todayIso ? { opacity: 0.35 } : undefined} className={`${date === todayIso ? "today" : ""} ${selectedDate === date ? "is-selected" : ""} ${hasRecord ? "has-ring" : ""}`}><span>{day}</span>{hasRecord && <i style={{ "--ring": `${Math.max(ring, 8)}%` } as React.CSSProperties} />}</button>; })}</div><div className="calendar-legend"><span><i className="legend-ring" /> 건강 점수 (100점)</span><span className="calendar-selected-label">{selectedMonthLabel}월 {selectedDay}일 선택됨</span></div><div className="record-sheet"><div className="record-sheet-heading"><div><span className="section-kicker">{selectedDate}</span><h3>{selectedMonthLabel}월 {selectedDay}일의 기록</h3></div><span className="record-day-score">{activity}점{bd ? ` · ${bd.grade}` : ""}</span></div>{selected ? <><div className="record-row"><span className="record-row-icon"><Clock3 size={17} /></span><div><strong>총 좌식시간</strong><span>{formatDuration(selected.totalSeconds)}</span></div></div><div className="record-row"><span className="record-row-icon"><Footprints size={17} /></span><div><strong>움직임 실현 횟수</strong><span>{selected.movementCount}회</span></div></div><div className="record-row"><span className="record-row-icon record-row-icon--peach"><HeartPulse size={17} /></span><div><strong>연속 좌식 최대 시간</strong><span>{selected.maxContinuousSeconds > 0 ? formatDuration(selected.maxContinuousSeconds) : "기록 없음"}</span></div></div><div className="record-row"><span className="record-row-icon"><Sparkles size={17} /></span><div><strong>최근 7일 평균 대비</strong><span>{delta === null ? "비교할 기록이 아직 없어요" : `${delta > 0 ? "+" : ""}${delta}점 (평균 ${selected.prev7Avg}점)`}</span></div></div>{bd && <div className="record-row"><span className="record-row-icon"><BarChart3 size={17} /></span><div><strong>점수 구성</strong><span>자주 끊기 {bd.a1} · 일어나서 끊기 {bd.a2} · 움직인 양 {bd.b} · 앉은 시간 {bd.c}{bd.d ? ` · 회복 +${bd.d}` : ""}{bd.bonus ? ` · 보너스 +${bd.bonus}` : ""}</span></div></div>}</> : <div className="record-row"><span className="record-row-icon"><Info size={17} /></span><div><strong>기록이 없어요</strong><span>{selectedDate === todayIso ? "오늘 사용을 시작하면 여기에 쌓여요" : "이 날은 앱을 사용하지 않았어요"}</span></div></div>}<div className="record-row record-row--signal"><span className="record-row-icon record-row-icon--peach"><Droplets size={17} /></span><div><strong>부종 기록</strong><span>{selected?.edema ? `${selected.edema}` : "그날 다리 붓기를 남겨보세요"}</span></div></div><div className="signal-picker"><div>{(["없음", "약함", "보통", "심함"] as EdemaLevel[]).map((lv) => <button key={lv} className={selected?.edema === lv ? "is-active" : ""} onClick={() => chooseEdema(lv)}>{lv}</button>)}</div></div></div><BottomNav current="calendar" onNavigate={onNavigate} /></div>;
+  return <div className="screen app-screen calendar-screen"><StatusBar /><div className="page-header"><div><span className="section-kicker">YOUR RECORD</span><h2>캘린더</h2></div><button className="icon-button" onClick={() => { setYear(Number(todayIso.slice(0, 4))); setMonth(Number(todayIso.slice(5, 7))); setSelectedDate(todayIso); }}><MoreHorizontal size={19} /></button></div><div className="calendar-summary"><div className="calendar-summary-icon"><CalendarDays size={17} /></div><div><strong>이번 달의 리듬</strong><span>{loading ? "불러오는 중..." : `${recordedDays}일 기록 · 일어나기 목표 ${doneDays}일 달성`}</span></div><div className="calendar-summary-score">{totalMovements}<span>회</span></div></div><div className="month-switcher"><button onClick={() => moveMonth(-1)}><ChevronLeft size={18} /></button><strong>{year}년 {month}월</strong><button onClick={() => moveMonth(1)} disabled={isCurrentMonth} style={isCurrentMonth ? { opacity: 0.3 } : undefined}><ChevronRight size={18} /></button></div><div className="calendar-weekdays">{WEEKDAY_LABEL.map((day) => <span key={day}>{day}</span>)}</div><div className="calendar-grid">{Array.from({ length: firstWeekday }, (_, i) => <span key={`pad-${i}`} />)}{days.map((day) => { const date = dateOf(day); const rec = records[date]; const ring = rec?.summary ? Math.min(100, (rec.summary.standCount / rec.summary.goal) * 100) : 0; const hasRecord = !!rec && (rec.totalSeconds > 0 || rec.movementCount > 0); return <button key={day} onClick={() => setSelectedDate(date)} disabled={date > todayIso} style={date > todayIso ? { opacity: 0.35 } : undefined} className={`${date === todayIso ? "today" : ""} ${selectedDate === date ? "is-selected" : ""} ${hasRecord ? "has-ring" : ""}`}><span>{day}</span>{hasRecord && <i style={{ "--ring": `${Math.max(ring, 8)}%` } as React.CSSProperties} />}</button>; })}</div><div className="calendar-legend"><span><i className="legend-ring" /> 일어나기 목표 달성률</span><span className="calendar-selected-label">{selectedMonthLabel}월 {selectedDay}일 선택됨</span></div><div className="record-sheet"><div className="record-sheet-heading"><div><span className="section-kicker">{selectedDate}</span><h3>{selectedMonthLabel}월 {selectedDay}일의 기록</h3></div><span className="record-day-score">{sm ? `${sm.standCount}/${sm.goal}회${sm.standDone ? " ✓" : ""}` : "-"}</span></div>{selected ? <><div className="record-row"><span className="record-row-icon"><Clock3 size={17} /></span><div><strong>좌식시간 (추정)</strong><span>{formatDuration(selected.totalSeconds)}</span></div></div><div className="record-row"><span className="record-row-icon"><Footprints size={17} /></span><div><strong>일어나기</strong><span>{sm ? `${sm.standCount}/${sm.goal}회${sm.standDone ? " · 목표 달성" : ""}` : "-"}</span></div></div><div className="record-row"><span className="record-row-icon record-row-icon--peach"><HeartPulse size={17} /></span><div><strong>가장 길게 앉아 있던 시간 (추정)</strong><span>{selected.maxContinuousSeconds > 0 ? formatDuration(selected.maxContinuousSeconds) : "기록 없음"}</span></div></div>{sm && <div className="record-row"><span className="record-row-icon"><BarChart3 size={17} /></span><div><strong>전체 실천</strong><span>{sm.totalCount}회 (앉아서 한 동작 {sm.seatedCount}회 포함){sm.plannedSitMin ? ` · 예정 앉은 시간 ${Math.round(sm.plannedSitMin / 6) / 10}시간` : ""}</span></div></div>}</> : <div className="record-row"><span className="record-row-icon"><Info size={17} /></span><div><strong>기록이 없어요</strong><span>{selectedDate === todayIso ? "오늘 사용을 시작하면 여기에 쌓여요" : "이 날은 앱을 사용하지 않았어요"}</span></div></div>}<div className="record-row record-row--signal"><span className="record-row-icon record-row-icon--peach"><Droplets size={17} /></span><div><strong>부종 기록</strong><span>{selected?.edema ? `${selected.edema}` : "그날 다리 붓기를 남겨보세요"}</span></div></div><div className="signal-picker"><div>{(["없음", "약함", "보통", "심함"] as EdemaLevel[]).map((lv) => <button key={lv} className={selected?.edema === lv ? "is-active" : ""} onClick={() => chooseEdema(lv)}>{lv}</button>)}</div></div></div><BottomNav current="calendar" onNavigate={onNavigate} /></div>;
 }
 
 function formatMinutes(min: number) {
@@ -699,7 +722,29 @@ function urlBase64ToUint8Array(base64: string) {
   return Uint8Array.from(Array.from(raw, (c) => c.charCodeAt(0)));
 }
 
-const EMPTY_BODY = { sex: "", birthYear: "", heightCm: "", weightKg: "", bodyFatPct: "" };
+const EMPTY_BODY = { sex: "", birthYear: "", heightCm: "", weightKg: "", bodyFatPct: "", activityLevel: "" };
+
+// ---- 불편한 부위 고르기 (몸 그림, lib/bodyShapes.ts) ----
+function BodyMap({ selected, onToggle }: { selected: Limitation[]; onToggle: (l: Limitation) => void }) {
+  const [side, setSide] = useState<"front" | "back">("front");
+  const shapes = side === "front" ? BODY_FRONT : BODY_BACK;
+  const draw = (list: BodyShape[], mirrored: boolean) => list.filter((sh) => !(mirrored && sh.center)).map((sh, i) => {
+    const on = !!sh.region && selected.includes(sh.region);
+    const cls = `${sh.head ? "is-head" : ""} ${sh.region ? "body-spot" : ""} ${on ? "is-on" : ""}`;
+    if (!sh.region) return <path key={i} d={sh.d} className={cls} />;
+    const region = sh.region;
+    return <path key={i} d={sh.d} className={cls} role="button" aria-pressed={on} aria-label={LIMITATION_LABEL[region]} tabIndex={mirrored ? -1 : 0}
+      onClick={() => onToggle(region)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle(region); } }} />;
+  });
+  return <div className="body-map">
+    <div className="body-map-tabs">{(["front", "back"] as const).map((sd) => <button key={sd} className={side === sd ? "is-on" : ""} onClick={() => setSide(sd)}>{sd === "front" ? "앞" : "뒤"}</button>)}</div>
+    <svg viewBox="20 0 160 395" role="group" aria-label={`몸 ${side === "front" ? "앞" : "뒤"}면, 불편한 부위를 누르세요`}>
+      <g className="body-map-base">{BODY_BASE.map((d, i) => <path key={i} d={d} />)}<g transform="translate(200 0) scale(-1 1)">{BODY_BASE.map((d, i) => <path key={i} d={d} />)}</g></g>
+      <g className="body-map-muscle">{draw(shapes, false)}<g transform="translate(200 0) scale(-1 1)">{draw(shapes, true)}</g></g>
+    </svg>
+    <p className="body-map-picked">{selected.length ? selected.map((l) => LIMITATION_LABEL[l]).join(" · ") : "신경 쓰이는 곳을 눌러요 (다시 누르면 해제)"}</p>
+  </div>;
+}
 
 function BodyForm({ initial, onSave, saveLabel, showDelete = false, onSaved }: { initial: BodyProfile; onSave: (p: BodyProfile | null) => Promise<string | null>; saveLabel: string; showDelete?: boolean; onSaved?: () => void }) {
   const [body, setBody] = useState<Record<string, string>>(() => ({
@@ -708,7 +753,10 @@ function BodyForm({ initial, onSave, saveLabel, showDelete = false, onSaved }: {
     heightCm: initial.heightCm ? String(initial.heightCm) : "",
     weightKg: initial.weightKg ? String(initial.weightKg) : "",
     bodyFatPct: initial.bodyFatPct ? String(initial.bodyFatPct) : "",
+    activityLevel: initial.activityLevel ?? "",
   }));
+  const [limits, setLimits] = useState<Limitation[]>(initial.limitations ?? []);
+  const [excluded, setExcluded] = useState<string[]>(initial.excluded ?? []);
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
   const draft: BodyProfile = {
@@ -717,11 +765,16 @@ function BodyForm({ initial, onSave, saveLabel, showDelete = false, onSaved }: {
     heightCm: body.heightCm ? Number(body.heightCm) : undefined,
     weightKg: body.weightKg ? Number(body.weightKg) : undefined,
     bodyFatPct: body.bodyFatPct ? Number(body.bodyFatPct) : undefined,
+    activityLevel: body.activityLevel === "low" || body.activityLevel === "mid" || body.activityLevel === "high" ? body.activityLevel : undefined,
+    limitations: limits.length ? limits : undefined,
+    excluded: excluded.length ? excluded : undefined,
   };
-  const corr = metCorrection(draft);
+  const sample = recommend({ categories: ["walk", "strength", "vigorous"], place: "home", availableMin: 3, profile: draft }).list.slice(0, 3).map((r) => EXERCISE_BY_ID[r.id].name);
   const set = (k: string, v: string) => { setBody((b) => ({ ...b, [k]: v })); setMsg(""); };
   return <>
-    <p className="body-purpose">운동 강도와 소모 칼로리를 내 몸에 맞게 계산하는 데만 써요. 모두 선택이고, 설정에서 언제든 고치거나 지울 수 있어요. 점수 기준(30분마다 끊기·하루 7시간 등)은 모두에게 같아요.</p>
+    <p className="body-purpose">나에게 맞는 운동을 추천하고 칼로리를 계산하는 데만 써요. 목표 기준(앉을 시간 ÷ 30분마다 일어나기)은 모두에게 같아요. 모두 선택이고 설정에서 언제든 고칠 수 있어요.</p>
+    <div className="body-chips"><span className="exercise-group-label">평소 운동</span><div className="action-chips action-chips--wrap">{(Object.keys(ACTIVITY_LABEL) as ActivityLevel[]).map((lv) => <button key={lv} className={body.activityLevel === lv ? "is-on" : ""} onClick={() => set("activityLevel", body.activityLevel === lv ? "" : lv)}>{ACTIVITY_LABEL[lv]}</button>)}</div></div>
+    <div className="body-chips"><span className="exercise-group-label">불편한 곳 (해당 부위에 부담 주는 동작은 빼고 추천)</span><BodyMap selected={limits} onToggle={(l) => { setLimits((cur) => cur.includes(l) ? cur.filter((x) => x !== l) : [...cur, l]); setMsg(""); }} /></div>
     <div className="body-grid">
       <label>성별<select value={body.sex} onChange={(e) => set("sex", e.target.value)}><option value="">선택 안 함</option><option value="male">남</option><option value="female">여</option></select></label>
       <label>출생연도<input inputMode="numeric" placeholder="예: 2005" value={body.birthYear} onChange={(e) => set("birthYear", e.target.value.replace(/[^0-9]/g, "").slice(0, 4))} /></label>
@@ -729,11 +782,12 @@ function BodyForm({ initial, onSave, saveLabel, showDelete = false, onSaved }: {
       <label>몸무게 (kg)<input inputMode="decimal" placeholder="예: 70" value={body.weightKg} onChange={(e) => set("weightKg", e.target.value.replace(/[^0-9.]/g, ""))} /></label>
       <label className="body-grid-wide">체지방률 (%) · 인바디 결과가 있으면<input inputMode="decimal" placeholder="모르면 비워두세요" value={body.bodyFatPct} onChange={(e) => set("bodyFatPct", e.target.value.replace(/[^0-9.]/g, ""))} /></label>
     </div>
-    <p className="body-preview">이 정보로 계산하면 정확도 <b>{corr.accuracy}</b>{corr.accuracy !== "기본" ? ` · 빠르게 걷기(기본 4.8 MET) → ${Math.round(4.8 * corr.factor * 10) / 10} MET` : " · 성별·출생연도·키·몸무게를 모두 넣으면 보정돼요"}</p>
+    {excluded.length > 0 && <div className="body-chips"><span className="exercise-group-label">추천에서 뺀 운동 (누르면 다시 추천)</span><div className="action-chips action-chips--wrap">{excluded.map((id) => <button key={id} className="is-on" onClick={() => { setExcluded((cur) => cur.filter((x) => x !== id)); setMsg(""); }}>{EXERCISE_BY_ID[id]?.name ?? id} ✕</button>)}</div></div>}
+    <p className="body-preview">집에서 3분 있을 때 추천 순서: <b>{sample.join(" → ")}</b></p>
     {msg && <p className="panel-msg">{msg}</p>}
     <div className="body-actions">
       <button className="panel-save" disabled={saving} onClick={async () => { setSaving(true); const err = await onSave(draft); setSaving(false); setMsg(err ?? "저장했어요"); if (!err) onSaved?.(); }}>{saveLabel}</button>
-      {showDelete && <button className="panel-delete" onClick={async () => { const err = await onSave(null); if (!err) setBody(EMPTY_BODY); setMsg(err ?? "몸 정보를 지웠어요"); }}>모두 지우기</button>}
+      {showDelete && <button className="panel-delete" onClick={async () => { const err = await onSave(null); if (!err) { setBody(EMPTY_BODY); setLimits([]); setExcluded([]); } setMsg(err ?? "몸 정보를 지웠어요"); }}>모두 지우기</button>}
     </div>
   </>;
 }
@@ -741,10 +795,10 @@ function BodyForm({ initial, onSave, saveLabel, showDelete = false, onSaved }: {
 function BodyInfoScreen({ nickname, onSave, onDone }: { nickname: string; onSave: (p: BodyProfile | null) => Promise<string | null>; onDone: () => void }) {
   return <div className="screen app-screen bodyinfo-screen"><StatusBar />
     <div className="bodyinfo-top"><AppLogo /><button className="bodyinfo-skip" onClick={onDone}>나중에 할게요</button></div>
-    <div className="bodyinfo-intro"><span className="section-kicker">ALMOST THERE · 선택</span><h2>{nickname}님 몸에 맞게<br />계산해 드릴게요</h2><p>같은 계단을 올라도 사람마다 힘든 정도가 달라요. 몸 정보를 알려주시면 운동 강도와 칼로리를 내 몸 기준으로 계산해요.</p></div>
+    <div className="bodyinfo-intro"><span className="section-kicker">ALMOST THERE · 선택</span><h2>{nickname}님에게 맞는<br />운동을 추천해 드릴게요</h2><p>같은 쉬는 시간 3분이어도 사람마다 맞는 운동이 달라요. 평소 운동 수준과 몸 정보를 알려주시면 추천 순서를 내게 맞춰요.</p></div>
     <div className="bodyinfo-card"><BodyForm initial={{}} onSave={onSave} saveLabel="저장하고 시작하기" onSaved={onDone} /></div>
-    <div className="bodyinfo-levels"><div><b>기본</b><span>입력 없음 · 표준 강도로 계산</span></div><div><b>보통</b><span>성별·출생연도·키·몸무게</span></div><div><b>높음</b><span>+ 체지방률 (근육·지방 구분)</span></div></div>
-    <p className="medical-note"><ShieldCheck size={13} /> 입력하지 않아도 점수는 똑같이 계산돼요. 강도 보정만 빠져요.</p>
+    <div className="bodyinfo-levels"><div><b>평소 운동</b><span>추천 강도 순서</span></div><div><b>불편한 곳</b><span>부담 주는 동작 제외</span></div><div><b>키·몸무게</b><span>관절 부담 적은 동작 우선 · 칼로리</span></div></div>
+    <p className="medical-note"><ShieldCheck size={13} /> 입력하지 않아도 목표와 기록은 똑같아요. 추천 순서만 기본값으로 정해져요.</p>
   </div>;
 }
 
@@ -810,7 +864,7 @@ function SettingsScreen({
   const [importMsg, setImportMsg] = useState("");
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const savedAcc = metCorrection(profile).accuracy;
+  const bodySummary = [profile.activityLevel ? `평소 운동 ${ACTIVITY_LABEL[profile.activityLevel]}` : "", (profile.limitations ?? []).map((l) => LIMITATION_LABEL[l]).join("·"), profile.excluded?.length ? `뺀 운동 ${profile.excluded.length}개` : ""].filter(Boolean).join(" · ");
   const toggleRow = (row: string) => setOpenRow((current) => current === row ? "" : row);
 
   const runImport = async (source: { ics?: string; url?: string }) => {
@@ -834,8 +888,8 @@ function SettingsScreen({
       <button className="panel-save" onClick={async () => { const err = await onSaveNickname(nick.trim()); setNickMsg(err ?? "저장했어요"); }}>저장</button>
     </div>}
     <div className="settings-group">
-      <span className="settings-group-label">맞춤 점수</span>
-      <div className="setting-row setting-row--clickable" onClick={() => toggleRow("body")}><span className="setting-icon setting-icon--orange"><HeartPulse size={17} /></span><div><strong>내 몸 정보 (선택)</strong><small>운동 강도 계산 정확도: {savedAcc}{savedAcc === "기본" ? " · 입력하면 내 몸에 맞게 보정돼요" : ""}</small></div><ChevronRight size={17} /></div>
+      <span className="settings-group-label">맞춤 추천</span>
+      <div className="setting-row setting-row--clickable" onClick={() => toggleRow("body")}><span className="setting-icon setting-icon--orange"><HeartPulse size={17} /></span><div><strong>내 몸 정보 (선택)</strong><small>{bodySummary || "입력하면 나에게 맞는 순서로 운동을 추천해요"}</small></div><ChevronRight size={17} /></div>
       {openRow === "body" && <div className="inline-panel body-panel"><BodyForm initial={profile} onSave={onSaveProfile} saveLabel="저장" showDelete /></div>}
     </div>
     <div className="settings-group">
@@ -927,8 +981,7 @@ export default function Home() {
   });
   const [todayMoves, setTodayMoves] = useState<MoveRecord[]>([]);
   const [todayRecoveries, setTodayRecoveries] = useState<RecoveryRecord[]>([]);
-  const [score, setScore] = useState<ScoreBreakdown>(EMPTY_SCORE);
-  const [goal, setGoal] = useState<DailyGoal | null>(null);
+  const [todayInfo, setTodayInfo] = useState<TodayInfo>(EMPTY_TODAY);
   const [profile, setProfile] = useState<BodyProfile>({});
   const [autoDetect, setAutoDetect] = useState(() => {
     try { return localStorage.getItem("sijakjeom_autodetect") === "on"; } catch { return false; }
@@ -959,8 +1012,7 @@ export default function Home() {
     setMovementCount(dash.todayMovementCount);
     setTodayMoves(dash.todayMoves ?? []);
     setTodayRecoveries(dash.todayRecoveries ?? []);
-    if (dash.score) setScore(dash.score);
-    setGoal(dash.goal ?? null);
+    if (dash.summary) setTodayInfo({ summary: dash.summary, suggestGoal: dash.suggestGoal, streak: dash.streak, history: dash.history ?? {} });
     setProfile(dash.profile ?? {});
     setQuiet(dash.quiet);
   };
@@ -1365,25 +1417,43 @@ export default function Home() {
     }
   };
 
-  const handleMoveComplete = async (exerciseId: string, durationSec: number, asRecovery: boolean) => {
+  const handleMoveComplete = async (exerciseId: string, durationSec: number) => {
     if (!session) return;
     setScreen("home");
     const name = EXERCISE_BY_ID[exerciseId]?.name ?? "움직임";
-    setContinuousSeconds(0);
-    notifiedRef.current = false;
+    const standing = EXERCISE_BY_ID[exerciseId]?.category !== "seated";
+    if (standing) { setContinuousSeconds(0); notifiedRef.current = false; }
     try {
-      const result = await api.logMovement(session.id, exerciseId, durationSec, asRecovery);
-      const gain = Math.round((result.score.total - score.total) * 10) / 10;
-      showToast(`${name} ${Math.max(1, Math.round(durationSec / 60))}분 기록 · 오늘 ${result.score.total}점${gain > 0 ? ` (+${gain})` : ""}`);
+      const result = await api.logMovement(session.id, exerciseId, durationSec);
+      const t = result.summary;
+      const prev = todayInfo.summary;
+      const msg = !standing ? "앉아서 한 동작은 기록만 해요"
+        : t.standCount > prev.standCount ? `일어나기 ${t.standCount}/${t.goal}회${t.standDone && !prev.standDone ? " 목표 달성!" : ""}`
+        : `일어나기는 ${STAND_DEDUPE_MIN}분 안에 이미 셌어요`;
+      showToast(`${name} ${Math.max(1, Math.round(durationSec / 60))}분 · ${msg}`);
       setMovementCount(result.todayMovementCount);
       setTodayMoves(result.todayMoves);
       setTodayRecoveries(result.todayRecoveries);
-      setScore(result.score);
-      setGoal(result.goal);
-      setContinuousSeconds(result.continuousSeconds);
+      setTodayInfo({ summary: result.summary, suggestGoal: result.suggestGoal, streak: result.streak, history: result.history });
     } catch {
       showToast("기록하지 못했어요. 잠시 후 다시 시도해주세요.");
     }
+  };
+
+  const handleSetToday = async (patch: { goal?: number | null; plannedSitMin?: number | null }) => {
+    if (!session) return;
+    try {
+      const r = await api.setToday(session.id, patch);
+      setTodayInfo((cur) => ({ ...cur, summary: r.summary, suggestGoal: r.suggestGoal, streak: r.streak }));
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.message : "저장하지 못했어요");
+    }
+  };
+
+  const handleExclude = async (exerciseId: string) => {
+    const excluded = Array.from(new Set([...(profile.excluded ?? []), exerciseId]));
+    const err = await handleSaveProfile({ ...profile, excluded });
+    showToast(err ?? `'${EXERCISE_BY_ID[exerciseId]?.name ?? "운동"}' 추천에서 뺐어요 (설정에서 되돌릴 수 있어요)`);
   };
 
   const handleSaveProfile = async (p: BodyProfile | null): Promise<string | null> => {
@@ -1423,7 +1493,7 @@ export default function Home() {
       return <AuthScreen mode={authMode} onModeChange={(m) => { setAuthMode(m); setAuthError(""); }} onBack={() => setScreen("splash")} onSubmit={handleAuthSubmit} onGoogle={handleGoogle} googleClientId={googleClientId} providers={providers} submitting={authSubmitting} error={authError} />;
     }
     if (screen === "bodyinfo") return <BodyInfoScreen nickname={session.nickname} onSave={handleSaveProfile} onDone={() => setScreen("home")} />;
-    if (screen === "timer") return <TimerScreen key={moveMode} mode={moveMode} todaySeconds={todaySeconds} continuousSeconds={continuousSeconds} moves={todayMoves} recoveries={todayRecoveries} profile={profile} onComplete={handleMoveComplete} onBack={() => { setScreen("home"); setMoveSheetOpen(true); }} />;
+    if (screen === "timer") return <TimerScreen key={moveMode} mode={moveMode} moves={todayMoves} recoveries={todayRecoveries} today={todayInfo} profile={profile} quiet={quiet} onComplete={handleMoveComplete} onExclude={handleExclude} onBack={() => { setScreen("home"); setMoveSheetOpen(true); }} />;
     if (screen === "timetable") return <TimetableScreen blocks={schedule} quietEnabled={session.scheduleQuietEnabled} onToggleQuiet={() => handleUpdateQuietEnabled(!session.scheduleQuietEnabled)} bottomNav={<BottomNav current="timetable" onNavigate={goToMain} />} onSave={handleSaveClass} onDelete={handleDeleteClass} />;
     if (screen === "calendar") return <CalendarScreen userId={session.id} onNavigate={goToMain} />;
     if (screen === "stats") return <StatsScreen userId={session.id} onNavigate={goToMain} weeklyMinutes={weeklyMinutes} breakIntervalMin={session.breakIntervalMin} />;
@@ -1463,8 +1533,9 @@ export default function Home() {
         continuousSeconds={continuousSeconds}
         todaySeconds={todaySeconds}
         movementCount={movementCount}
-        score={score}
-        goal={goal}
+        today={todayInfo}
+        onSetGoal={(goal) => handleSetToday({ goal })}
+        onSetPlanned={(plannedSitMin) => handleSetToday({ plannedSitMin, goal: null })}
         zone={zone}
         trackingOn={trackingOn}
         autoPaused={autoPaused}
@@ -1473,7 +1544,7 @@ export default function Home() {
         onNavigate={goToMain}
       />
     );
-  }, [authMode, authSubmitting, authError, moveMode, onboardingStep, screen, session, continuousSeconds, todaySeconds, movementCount, zone, trackingOn, weeklyMinutes, schedule, reminders, notifyOn, pushOn, pushSupported, googleClientId, providers, autoDetect, autoPaused, gpsMsg, score, goal, profile, todayMoves, todayRecoveries]);
+  }, [authMode, authSubmitting, authError, moveMode, onboardingStep, screen, session, continuousSeconds, todaySeconds, movementCount, zone, trackingOn, weeklyMinutes, schedule, reminders, notifyOn, pushOn, pushSupported, googleClientId, providers, autoDetect, autoPaused, gpsMsg, todayInfo, profile, todayMoves, todayRecoveries, quiet]);
 
   return <main className="prototype-page"><div className="ambient ambient-one" /><div className="ambient ambient-two" /><div className="prototype-layout"><PrototypeRail screen={screen} onNavigate={goTo} /><PhoneShell screen={screen}>{screenContent}{moveSheetOpen && <MoveSheet onClose={() => setMoveSheetOpen(false)} onSelect={chooseMove} />}{askSitting && <div className="sheet-backdrop"><div className="move-sheet" onClick={(e) => e.stopPropagation()}><div className="sheet-handle" /><div className="sheet-heading"><div><span className="section-kicker">ARE YOU SITTING?</span><h2>지금 앉아 계신가요?</h2><p>움직임이 멈춘 것 같아요. 앉았다면 좌식 타이머를 다시 켤게요.</p></div></div><div className="ask-actions"><button className="primary-button" onClick={() => { setAskSitting(false); void setTracking(true, false); }}><Check size={17} /> 네, 앉았어요</button><button className="secondary-button" onClick={() => setAskSitting(false)}>아니요, 계속 움직여요</button></div></div></div>}{toast && <div className="toast-message"><Check size={16} /> {toast}</div>}</PhoneShell></div><footer className="prototype-footer"><span>INTERACTIVE MOBILE PROTOTYPE</span><span>사용자 행동을 바꾸는 가장 작은 시작점</span><span>© 2026 SIJAKJEOM</span></footer></main>;
 }
