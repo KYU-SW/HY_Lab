@@ -13,7 +13,9 @@ export function loadSession(): SessionUser | null {
 
 export function saveSession(user: SessionUser) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(user));
+    // 프로필 수정 응답에는 토큰이 없으므로 기존 토큰을 유지
+    const token = user.token ?? loadSession()?.token;
+    localStorage.setItem(KEY, JSON.stringify({ ...user, token }));
   } catch {
     /* 저장 실패는 조용히 무시 (프라이빗 모드 등) */
   }

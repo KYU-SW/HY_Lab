@@ -1,4 +1,5 @@
 import { enabledProviders, registerOAuthRoutes } from "./oauth";
+import { authed, requireAuth } from "./auth";
 import type { Express, Request, Response } from "express";
 import {
   addHeartbeatSeconds,
@@ -20,6 +21,12 @@ import {
   getMonthLog,
   getToday,
   getCurrentSegment,
+  scheduleSegments,
+  deleteUser,
+  exportCsv,
+  logAlert,
+  lowResponseHours,
+  touchSeen,
   moveHistory,
   setTodayPlan,
   getTodayLog,
@@ -88,8 +95,16 @@ function requireUser(req: Request, res: Response): string | null {
     res.status(404).json({ error: "존재하지 않는 사용자입니다." });
     return null;
   }
+  // 토큰의 본인과 요청한 사용자가 같아야 함 (남의 기록 조회·수정 차단)
+  if ((req as Request & { authUserId?: string }).authUserId !== id) {
+    res.status(403).json({ error: "본인 기록만 볼 수 있어요." });
+    return null;
+  }
   return id;
 }
+
+const HEALTH_KEYS = ["sex", "birthYear", "heightCm", "weightKg", "bodyFatPct", "activityLevel", "limitations"] as const;
+const hasHealth = (p: BodyProfile) => HEALTH_KEYS.some((k) => p[k] !== undefined);
 
 async function verifyGoogleCredential(credential: string) {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -107,6 +122,8 @@ async function verifyGoogleCredential(credential: string) {
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 export function registerApiRoutes(app: Express) {
+  app.use("/api", requireAuth);
+
   // ---------- 공개 설정 (구글 클라이언트 ID, 푸시 공개키) ----------
 
   app.get("/api/config", (_req, res) => {
@@ -118,7 +135,7 @@ export function registerApiRoutes(app: Express) {
   app.post("/api/auth/google", async (req, res) => {
     try {
       const { email, name } = await verifyGoogleCredential(String(req.body?.credential ?? ""));
-      res.json({ user: publicUser(findOrCreateGoogleUser(email, name)) });
+      res.json(authed(findOrCreateGoogleUser(email, name)));
     } catch (e) {
       res.status(401).json({ error: e instanceof Error ? e.message : "구글 로그인에 실패했어요." });
     }
@@ -136,7 +153,7 @@ export function registerApiRoutes(app: Express) {
     }
     const user = createUser(String(nickname).trim(), String(email).trim(), String(password));
     if (!user) return res.status(409).json({ error: "이미 가입된 이메일입니다." });
-    res.status(201).json({ user: publicUser(user) });
+    res.status(201).json(authed(user));
   });
 
   app.post("/api/auth/login", (req, res) => {
@@ -145,7 +162,7 @@ export function registerApiRoutes(app: Express) {
     if (!user || !verifyPassword(String(password ?? ""), user.salt, user.passwordHash)) {
       return res.status(401).json({ error: "이메일 또는 비밀번호가 올바르지 않습니다." });
     }
-    res.json({ user: publicUser(user) });
+    res.json(authed(user));
   });
 
   // ---------- 사용자 ----------
@@ -159,7 +176,7 @@ export function registerApiRoutes(app: Express) {
   app.patch("/api/users/:id", (req, res) => {
     const id = requireUser(req, res);
     if (!id) return;
-    const { nickname, breakIntervalMin, scheduleQuietEnabled, trackingEnabled, profile } = req.body ?? {};
+    const { nickname, breakIntervalMin, scheduleQuietEnabled, trackingEnabled, profile, healthConsent } = req.body ?? {};
     const patch: Record<string, unknown> = {};
     if (typeof nickname === "string") {
       const trimmed = nickname.trim();
@@ -169,9 +186,12 @@ export function registerApiRoutes(app: Express) {
     if (typeof breakIntervalMin === "number") patch.breakIntervalMin = breakIntervalMin;
     if (typeof scheduleQuietEnabled === "boolean") patch.scheduleQuietEnabled = scheduleQuietEnabled;
     if (typeof trackingEnabled === "boolean") patch.trackingEnabled = trackingEnabled;
-    if (profile !== undefined) {
+    if (healthConsent === true) patch.healthConsentAt = new Date().toISOString();
+    if (healthConsent === false) { patch.healthConsentAt = undefined; patch.profile = { excluded: getUser(id)!.profile?.excluded }; } // 동의 철회 → 건강 정보 삭제
+    if (profile !== undefined && healthConsent !== false) {
       const cleaned = cleanProfile(profile);
       if (!cleaned) return res.status(400).json({ error: "범위를 벗어난 값이 있어요. 출생연도·키(100~250cm)·몸무게(25~300kg)·체지방률(3~70%)을 확인해주세요." });
+      if (hasHealth(cleaned) && !getUser(id)!.healthConsentAt && healthConsent !== true) return res.status(400).json({ error: "건강 정보 수집·이용에 동의해야 저장할 수 있어요." });
       patch.profile = cleaned;
     }
     const user = updateUser(id, patch);
@@ -184,6 +204,7 @@ export function registerApiRoutes(app: Express) {
     const id = requireUser(req, res);
     if (!id) return;
     const user = getUser(id)!;
+    touchSeen(id);
     const lastMovedAt = getLastMovedAt(id);
     const trackingEnabled = user.trackingEnabled !== false;
     const elapsedSeconds = trackingEnabled ? Math.max(0, Math.round((Date.now() - new Date(lastMovedAt).getTime()) / 1000)) : 0;
@@ -195,8 +216,9 @@ export function registerApiRoutes(app: Express) {
       todayMovementCount: today.movementCount,
       todayMoves: today.moves ?? [],
       todayRecoveries: today.recoveries ?? [],
-      todaySegments: today.segments ?? [],
+      todaySegments: [...(today.segments ?? []), ...scheduleSegments(id, todayIso())],
       currentSegment: getCurrentSegment(id),
+      lowHours: lowResponseHours(id),
       ...getToday(id),
       history: moveHistory(id),
       profile: user.profile ?? {},
@@ -224,7 +246,9 @@ export function registerApiRoutes(app: Express) {
     const exerciseId = String(req.body?.exerciseId ?? "");
     if (!EXERCISE_BY_ID[exerciseId]) return res.status(400).json({ error: "알 수 없는 운동이에요." });
     const durationSec = Number(req.body?.durationSec) || 0;
-    const dayLog = markMoved(id, exerciseId, durationSec)!;
+    const c = req.body?.check;
+    const check = c === "verified" || c === "unverified" || c === "na" ? c : undefined;
+    const dayLog = markMoved(id, exerciseId, durationSec, check)!;
     res.json({
       todayMovementCount: dayLog.movementCount,
       todayMoves: dayLog.moves ?? [],
@@ -233,6 +257,31 @@ export function registerApiRoutes(app: Express) {
       history: moveHistory(id),
       standing: EXERCISE_BY_ID[exerciseId].category !== "seated",
     });
+  });
+
+  // 앱 안에서 보여준 휴식 알림 기록 (푸시는 서버가 직접 기록)
+  app.post("/api/users/:id/alerts", (req, res) => {
+    const id = requireUser(req, res);
+    if (!id) return;
+    logAlert(id);
+    res.status(201).json({ ok: true });
+  });
+
+  // 파일럿 분석용 내 기록 내보내기 (CSV, 이름·이메일 없음)
+  app.get("/api/users/:id/export", (req, res) => {
+    const id = requireUser(req, res);
+    if (!id) return;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="sijakjeom_records.csv"');
+    res.send("\ufeff" + exportCsv(id));
+  });
+
+  // 계정과 모든 기록 삭제
+  app.delete("/api/users/:id", (req, res) => {
+    const id = requireUser(req, res);
+    if (!id) return;
+    deleteUser(id);
+    res.status(204).end();
   });
 
   // 오늘 목표 / 예정 앉은 시간 (null이면 지움)

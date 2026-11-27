@@ -28,6 +28,9 @@ const median = (xs: number[]) => {
 };
 
 /** 걸음 박자 감지: 가속도 크기를 보고 "규칙적인 걸음 리듬"인지 판단 */
+/** 걸음으로 볼 최소 출렁임(m/s²). 주머니 속 걷기는 보통 1 이상, 손에 들고 보며 걸으면 0.4~1 */
+const STEP_MIN_PEAK = 0.35;
+
 export class StepDetector {
   private samples: { t: number; m: number }[] = [];
   push(ax: number, ay: number, az: number, t: number) {
@@ -48,7 +51,7 @@ export class StepDetector {
     const x = sm.map((v) => v - mean);
     const peaks: { t: number; h: number }[] = [];
     for (let i = 1; i < x.length - 1; i++) {
-      if (x[i] > 0.8 && x[i] >= x[i - 1] && x[i] > x[i + 1]) {
+      if (x[i] > STEP_MIN_PEAK && x[i] >= x[i - 1] && x[i] > x[i + 1]) {
         const last = peaks[peaks.length - 1];
         if (!last || s[i].t - last.t >= 250) peaks.push({ t: s[i].t, h: x[i] });
         else if (x[i] > last.h) { last.t = s[i].t; last.h = x[i]; }
@@ -64,14 +67,16 @@ export class StepDetector {
       for (let i = 0; i + lag < x.length; i++) c += x[i] * x[i + lag];
       best = Math.max(best, c / varX);
     }
-    if (best < 0.4) return false;
+    const medH0 = median(peaks.map((p) => p.h));
+    // 폰을 손에 들고 화면을 보며 걸으면 출렁임이 작음 → 작을수록 규칙성(자기상관)을 더 엄격하게 봄
+    if (best < (medH0 < 0.8 ? 0.55 : 0.4)) return false;
     const intervals = peaks.slice(1).map((p, i) => p.t - peaks[i].t);
     const mi = intervals.reduce((a, b) => a + b, 0) / intervals.length;
     const sd = Math.sqrt(intervals.reduce((a, b) => a + (b - mi) ** 2, 0) / intervals.length);
     const freq = 1000 / mi;
     const medH = median(peaks.map((p) => p.h));
     // 걷기/달리기 박자 1.3~3.2Hz, 일정한 간격, 너무 세지 않은 진폭(세게 흔들면 탈락)
-    return freq >= 1.3 && freq <= 3.2 && sd / mi < 0.3 && medH >= 0.8 && medH <= 10;
+    return freq >= 1.3 && freq <= 3.2 && sd / mi < 0.3 && medH >= STEP_MIN_PEAK && medH <= 10;
   }
 }
 

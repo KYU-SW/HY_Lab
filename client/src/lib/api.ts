@@ -1,3 +1,4 @@
+import { clearSession, loadSession } from "./session";
 import type { Accuracy, BodyProfile, DaySummary, MoveRecord, RecoveryRecord } from "@shared/scoring";
 
 export type SessionUser = {
@@ -8,6 +9,8 @@ export type SessionUser = {
   scheduleQuietEnabled: boolean;
   trackingEnabled?: boolean;
   profile?: BodyProfile;
+  healthConsentAt?: string;
+  token?: string; // 로그인 토큰 (모든 API 요청에 붙임)
   createdAt: string;
 };
 
@@ -18,8 +21,8 @@ export type TodayInfo = {
   history: Record<string, number>; // 최근 14일 운동별 완료 횟수
 };
 
-export type SitSource = "estimate" | "self" | "unknown";
-export type SitSegment = { start: string; end: string; source: SitSource };
+export type SitSource = "estimate" | "self" | "unknown" | "schedule";
+export type SitSegment = { start: string; end: string; source: SitSource; unseenMin?: number; title?: string };
 
 export type RiskZone = { level: "safe" | "notice" | "risk"; label: string };
 
@@ -31,6 +34,7 @@ export type Dashboard = TodayInfo & {
   todayRecoveries: RecoveryRecord[];
   todaySegments: SitSegment[];
   currentSegment: { start: string; source: SitSource } | null;
+  lowHours: { hour: number; sent: number; rate: number }[];
   profile: BodyProfile;
   accuracy: Accuracy;
   breakIntervalMin: number;
@@ -84,11 +88,22 @@ class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+/** 로그인 토큰을 붙여 요청. 토큰이 만료·무효면 로그아웃하고 처음 화면으로 */
+async function authFetch(path: string, options: RequestInit = {}) {
+  const token = loadSession()?.token;
   const res = await fetch(path, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers ?? {}) },
   });
+  if (res.status === 401 && !path.startsWith("/api/auth/")) {
+    clearSession();
+    window.location.reload();
+  }
+  return res;
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await authFetch(path, options);
   const isJson = res.headers.get("content-type")?.includes("application/json");
   const body = isJson ? await res.json().catch(() => ({})) : undefined;
   if (!res.ok) {
@@ -106,7 +121,7 @@ export const api = {
 
   getUser: (id: string) => request<{ user: SessionUser }>(`/api/users/${id}`),
 
-  updateUser: (id: string, patch: Partial<Pick<SessionUser, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled">> & { profile?: BodyProfile | null }) =>
+  updateUser: (id: string, patch: Partial<Pick<SessionUser, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled">> & { profile?: BodyProfile | null; healthConsent?: boolean }) =>
     request<{ user: SessionUser }>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
   getDashboard: (id: string) => request<Dashboard>(`/api/dashboard/${id}`),
@@ -117,10 +132,10 @@ export const api = {
       body: JSON.stringify({ user_id: userId, seconds }),
     }),
 
-  logMovement: (userId: string, exerciseId: string, durationSec: number) =>
+  logMovement: (userId: string, exerciseId: string, durationSec: number, check?: "verified" | "unverified" | "na") =>
     request<TodayInfo & { todayMovementCount: number; todayMoves: MoveRecord[]; todayRecoveries: RecoveryRecord[]; standing: boolean }>("/api/movements", {
       method: "POST",
-      body: JSON.stringify({ user_id: userId, exerciseId, durationSec }),
+      body: JSON.stringify({ user_id: userId, exerciseId, durationSec, check }),
     }),
 
   setToday: (userId: string, patch: { goal?: number | null; plannedSitMin?: number | null }) =>
@@ -151,13 +166,13 @@ export const api = {
   updateReminder: (id: string, rid: string, patch: Partial<Omit<ReminderTime, "id">>) =>
     request<{ reminder: ReminderTime }>(`/api/users/${id}/reminders/${rid}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
-  removeReminder: (id: string, rid: string) => fetch(`/api/users/${id}/reminders/${rid}`, { method: "DELETE" }),
+  removeReminder: (id: string, rid: string) => authFetch(`/api/users/${id}/reminders/${rid}`, { method: "DELETE" }),
 
   subscribePush: (id: string, subscription: PushSubscriptionJSON) =>
     request<{ ok: boolean }>(`/api/users/${id}/push`, { method: "POST", body: JSON.stringify({ subscription }) }),
 
   unsubscribePush: (id: string, endpoint: string) =>
-    fetch(`/api/users/${id}/push`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint }) }),
+    authFetch(`/api/users/${id}/push`, { method: "DELETE", body: JSON.stringify({ endpoint }) }),
 
   importIcs: (id: string, source: { ics?: string; url?: string }) =>
     request<{ added: number; skipped: { allDay: number; past: number; unsupported: number }; blocks: ScheduleBlock[] }>(
@@ -174,7 +189,20 @@ export const api = {
     request<{ block: ScheduleBlock }>(`/api/users/${userId}/schedule/${blockId}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
   removeScheduleBlock: (userId: string, blockId: string) =>
-    fetch(`/api/users/${userId}/schedule/${blockId}`, { method: "DELETE" }),
+    authFetch(`/api/users/${userId}/schedule/${blockId}`, { method: "DELETE" }),
+
+  logAlert: (userId: string) => request<{ ok: boolean }>(`/api/users/${userId}/alerts`, { method: "POST" }),
+
+  exportCsv: async (userId: string) => {
+    const res = await authFetch(`/api/users/${userId}/export`);
+    if (!res.ok) throw new ApiError("내보내지 못했어요");
+    return res.blob();
+  },
+
+  deleteAccount: async (userId: string) => {
+    const res = await authFetch(`/api/users/${userId}`, { method: "DELETE" });
+    if (!res.ok) throw new ApiError("삭제하지 못했어요");
+  },
 };
 
 export { ApiError };

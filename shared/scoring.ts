@@ -53,7 +53,7 @@ export const EXERCISES: Exercise[] = [
 
 export const EXERCISE_BY_ID: Record<string, Exercise> = Object.fromEntries(EXERCISES.map((e) => [e.id, e]));
 
-/** 카테고리별 권장 시간(초). 걷기·근력 3분, 숨찬 활동 1분, 앉아서 1분, 오래 하는 운동 10분 */
+/** 카테고리별 기본 권장 시간(초). 걷기·근력 3분, 숨찬 활동 1분, 앉아서 1분, 오래 하는 운동 10분 */
 export const RECOMMENDED_SEC: Record<ExerciseCategory, number> = {
   seated: 60,
   walk: 180,
@@ -77,6 +77,7 @@ export type MoveRecord = {
   exerciseId: string;
   durationSec: number;
   priorSitSec: number; // 이 동작 직전 연속 좌식 시간 (추정, 기록용)
+  check?: "verified" | "unverified" | "na"; // 휴대폰 센서로 움직임이 확인됐나 (na=센서 없음·앉은 동작)
 };
 
 /** 예전 형식(회복 활동 따로 저장). 지금은 모두 moves에 저장하지만 예전 기록을 읽기 위해 남겨둔다. */
@@ -175,6 +176,7 @@ export type PlanSource = "self" | "timetable" | "none";
 
 export type DaySummary = {
   standCount: number; // 일어나기 인정 횟수 (메인 목표)
+  standVerified: number; // 그중 센서로 움직임이 확인된 횟수
   standRaw: number; // 일어나서 한 동작 전체 횟수 (30분 중복 포함)
   seatedCount: number; // 앉아서 한 동작 (기록만)
   totalCount: number; // 전체 실천 횟수
@@ -204,6 +206,7 @@ export function summarizeDay(input: {
   const goal = Math.max(range.min, Math.min(48, Math.round(input.goal ?? range.rec ?? 1)));
 
   let standCount = 0;
+  let standVerified = 0;
   let standRaw = 0;
   let seatedCount = 0;
   let activeMin = 0;
@@ -219,7 +222,7 @@ export function summarizeDay(input: {
     standRaw += 1;
     const t = m.at ? new Date(m.at).getTime() : NaN;
     if (Number.isNaN(t)) { standCount += 1; continue; } // 시각 없는 예전 기록은 각각 1회
-    if (t - lastCounted >= STAND_DEDUPE_MIN * 60_000) { standCount += 1; lastCounted = t; }
+    if (t - lastCounted >= STAND_DEDUPE_MIN * 60_000) { standCount += 1; lastCounted = t; if (m.check === "verified") standVerified += 1; }
   }
   for (const r of recoveries) {
     const ex = EXERCISE_BY_ID[r.exerciseId];
@@ -230,6 +233,7 @@ export function summarizeDay(input: {
 
   return {
     standCount,
+    standVerified,
     standRaw,
     seatedCount,
     totalCount: standRaw + seatedCount + recoveries.length,
@@ -257,7 +261,7 @@ export function goalSuggestion(past: { standDone: boolean; goal: number }[], tod
 // ---------- 맞춤 추천 E(u,t) ----------
 
 export type Place = "class" | "home" | "outdoor";
-export const PLACE_LABEL: Record<Place, string> = { class: "강의실·도서관", home: "집·기숙사", outdoor: "복도·야외" };
+export const PLACE_LABEL: Record<Place, string> = { class: "강의실·도서관", home: "실내(집·기숙사 등)", outdoor: "복도·야외" };
 
 /** 장소별로 할 수 없는 동작 (조용해야 함 / 공간·계단·야외 필요) */
 const NOT_IN_PLACE: Record<Place, string[]> = {
@@ -343,4 +347,13 @@ export function recommend(input: {
   }
   list.sort((a, b) => b.fit - a.fit);
   return { list, hidden };
+}
+
+/** 30분 넘게 앉아 있었으면 걷기·근력 권장 시간을 5분으로 (30분마다 5분 걷기만 혈당까지 낮춤, Duran 2023) */
+export const LONG_SIT_MIN = 30;
+export const LONG_SIT_SEC = 300;
+export function recommendedSec(category: ExerciseCategory, sitSec: number) {
+  const base = RECOMMENDED_SEC[category];
+  if ((category === "walk" || category === "strength") && sitSec >= LONG_SIT_MIN * 60) return Math.max(base, LONG_SIT_SEC);
+  return base;
 }

@@ -5,6 +5,8 @@ import {
   getPushSubs,
   getUser,
   getHeld,
+  logAlert,
+  lowResponseHours,
   getVapid,
   isQuietNow,
   setHeld,
@@ -66,12 +68,16 @@ export function startPushScheduler() {
       if (user.trackingEnabled !== false) {
         const lastMovedAt = getLastMovedAt(userId);
         const elapsedSec = (Date.now() - new Date(lastMovedAt).getTime()) / 1000;
-        const due = elapsedSec >= user.breakIntervalMin * 60;
+        // 반응이 낮은 시간대는 알림 간격을 2배로 (최근 14일 3번 이상, 15분 안에 움직인 비율 30% 미만)
+        const hour = Math.floor(minutes / 60);
+        const slow = lowResponseHours(userId).some((h) => h.hour === hour);
+        const due = elapsedSec >= user.breakIntervalMin * 60 * (slow ? 2 : 1);
         const held = getHeld(userId);
         if (held && held.lastMovedAt !== lastMovedAt) setHeld(userId, undefined); // 이미 움직임
         else if (held && !quiet) {
           setHeld(userId, undefined);
           breakNotified.set(userId, lastMovedAt);
+          logAlert(userId);
           void sendToUser(userId, {
             title: "시작점",
             body: `수업 끝났어요. ${Math.round(elapsedSec / 60)}분째 앉아 있어요. 쉬는 시간에 잠깐 일어나볼까요?`,
@@ -81,9 +87,10 @@ export function startPushScheduler() {
           if (quiet) setHeld(userId, { at: new Date().toISOString(), lastMovedAt });
           else {
             breakNotified.set(userId, lastMovedAt);
+            logAlert(userId);
             void sendToUser(userId, {
               title: "시작점",
-              body: `${user.breakIntervalMin}분이 지났어요. 잠깐 일어나서 움직여볼까요?`,
+              body: `${Math.round(elapsedSec / 60)}분째 앉아 있어요. 잠깐 일어나서 움직여볼까요?`,
               tag: "break",
             });
           }

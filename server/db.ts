@@ -35,13 +35,17 @@ export type ReminderTime = {
 };
 
 /** 좌식 구간. estimate=타이머·움직임 기록으로 추정 / self=사용자가 앉았다고 확인 / unknown=타이머 꺼짐(미확인) */
-export type SitSource = "estimate" | "self" | "unknown";
-export type SitSegment = { start: string; end: string; source: SitSource };
+export type SitSource = "estimate" | "self" | "unknown" | "schedule";
+export type SitSegment = { start: string; end: string; source: SitSource; unseenMin?: number };
+/** 보낸 휴식 알림. responded = 15분 안에 일어나서 움직임 */
+export type AlertLog = { at: string; responded?: boolean };
 type UserState = {
   lastMovedAt: string;
   sitSource?: "estimate" | "self"; // 지금 이어지는 좌식 구간이 어떻게 시작됐나
   offAt?: string; // 타이머를 끈 시각 (미확인 구간 시작)
   held?: { at: string; lastMovedAt: string }; // 수업 중이라 보류한 알림
+  lastSeenAt?: string; // 앱이 마지막으로 열려 있던 시각 (하트비트)
+  unseenSec?: number; // 지금 좌식 구간 중 앱이 닫혀 있던 시간
 };
 
 export type EdemaLevel = "없음" | "약함" | "보통" | "심함";
@@ -57,7 +61,8 @@ export type User = {
   breakIntervalMin: number; // 권장 휴식 주기 (분)
   scheduleQuietEnabled: boolean;
   trackingEnabled?: boolean; // 좌식 타이머 온/오프 (없으면 켜짐)
-  profile?: BodyProfile; // 몸 정보 (선택 입력, 운동 강도 보정용)
+  profile?: BodyProfile; // 몸 정보 (선택 입력, 추천 순서·칼로리용)
+  healthConsentAt?: string; // 건강 관련 민감정보 수집·이용 동의 시각
   createdAt: string;
 };
 
@@ -70,6 +75,7 @@ export type DayLog = {
   moves?: MoveRecord[]; // 움직임 기록: 어떤 운동을, 몇 초, 직전에 몇 분 앉아 있다가
   recoveries?: RecoveryRecord[]; // (예전 형식) 회복 활동 기록 — 지금은 moves에 함께 저장
   segments?: SitSegment[]; // 좌식 구간 (끝난 것만)
+  alerts?: AlertLog[]; // 보낸 휴식 알림과 반응 여부
   goal?: number; // 사용자가 정한 오늘 일어나기 목표
   plannedSitMin?: number; // "오늘 몇 시간 앉을 것 같아요?" 답 (분)
 };
@@ -98,6 +104,19 @@ export function plannedFromSchedule(userId: string, date: string): number {
   return total;
 }
 
+/** 일정표로 추정한 좌식 구간: 그날 일정 중 이미 시작한 것 (지금까지로 자름). title 포함 */
+export function scheduleSegments(userId: string, date: string): (SitSegment & { title: string })[] {
+  const day = new Date(date + "T12:00:00+09:00").getUTCDay();
+  const now = Date.now();
+  const at = (hm: string) => new Date(`${date}T${hm.padStart(5, "0")}:00+09:00`).getTime();
+  return (db.schedule[userId] ?? [])
+    .filter((b) => (b.date ? b.date === date : b.day === null || b.day === day))
+    .map((b) => ({ s: at(b.start), e: Math.min(at(b.end), now), title: b.title }))
+    .filter((r) => r.e - r.s >= 60_000)
+    .sort((a, b) => a.s - b.s)
+    .map((r) => ({ start: new Date(r.s).toISOString(), end: new Date(r.e).toISOString(), source: "schedule" as const, title: r.title }));
+}
+
 /** 오늘 앉을 시간: ① 사용자 답 → ② 일정표 → ③ 없음 */
 function planOf(userId: string, date: string, log?: DayLog): { plannedSitMin: number | null; planSource: PlanSource } {
   if (log?.plannedSitMin) return { plannedSitMin: log.plannedSitMin, planSource: "self" };
@@ -123,6 +142,7 @@ type DB = {
   reminders: Record<string, ReminderTime[]>; // userId -> 지정 시각 알림
   pushSubs: Record<string, PushSub[]>; // userId -> 웹 푸시 구독
   vapid?: { publicKey: string; privateKey: string };
+  secret?: string; // 로그인 토큰 서명 키
 };
 
 function emptyDb(): DB {
@@ -303,7 +323,7 @@ export function getUser(id: string): User | undefined {
   return db.users[id];
 }
 
-export function updateUser(id: string, patch: Partial<Pick<User, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled" | "profile">>) {
+export function updateUser(id: string, patch: Partial<Pick<User, "nickname" | "breakIntervalMin" | "scheduleQuietEnabled" | "trackingEnabled" | "profile" | "healthConsentAt">>) {
   const user = db.users[id];
   if (!user) return undefined;
   const wasOn = user.trackingEnabled !== false;
@@ -323,7 +343,7 @@ export function updateUser(id: string, patch: Partial<Pick<User, "nickname" | "b
       const dayLog = ((db.sitting[id] ??= {})[todayIso()] ??= { totalSeconds: 0, movementCount: 0 });
       pushSegment(dayLog, { start: prev.offAt, end: new Date().toISOString(), source: "unknown" });
     }
-    db.state[id] = { lastMovedAt: new Date().toISOString(), sitSource: "self" };
+    db.state[id] = { ...prev, lastMovedAt: new Date().toISOString(), sitSource: "self", offAt: undefined, unseenSec: 0 };
   }
   save(db);
   return user;
@@ -344,7 +364,84 @@ function closeSegment(userId: string, dayLog: DayLog, endMs: number) {
   const startMs = new Date(st.lastMovedAt).getTime();
   // 날짜가 바뀌었으면 오늘 0시부터로 자름
   const dayStart = new Date(todayIso() + "T00:00:00+09:00").getTime();
-  pushSegment(dayLog, { start: new Date(Math.max(startMs, dayStart)).toISOString(), end: new Date(endMs).toISOString(), source: st.sitSource ?? "estimate" });
+  const unseenMin = Math.round((st.unseenSec ?? 0) / 60);
+  pushSegment(dayLog, { start: new Date(Math.max(startMs, dayStart)).toISOString(), end: new Date(endMs).toISOString(), source: st.sitSource ?? "estimate", ...(unseenMin > 0 ? { unseenMin } : {}) });
+  st.unseenSec = 0;
+}
+
+/** 앱이 열려 있다는 신호. 5분 넘게 신호가 없었으면 그 시간은 "앱 닫힘"으로 지금 좌식 구간에 기록 */
+export function touchSeen(userId: string) {
+  const st = db.state[userId];
+  if (!st) return;
+  const now = Date.now();
+  if (st.lastSeenAt && db.users[userId]?.trackingEnabled !== false) {
+    const from = Math.max(new Date(st.lastSeenAt).getTime(), new Date(st.lastMovedAt).getTime());
+    const gap = (now - from) / 1000;
+    if (gap > 300) st.unseenSec = (st.unseenSec ?? 0) + gap;
+  }
+  st.lastSeenAt = new Date(now).toISOString();
+}
+
+// ---------- 알림 반응 (시간대별) ----------
+
+const ALERT_RESPONSE_MIN = 15;
+
+export function logAlert(userId: string) {
+  const dayLog = ((db.sitting[userId] ??= {})[todayIso()] ??= { totalSeconds: 0, movementCount: 0 });
+  (dayLog.alerts ??= []).push({ at: new Date().toISOString() });
+  save(db);
+}
+
+function markAlertResponded(dayLog: DayLog) {
+  const last = dayLog.alerts?.[dayLog.alerts.length - 1];
+  if (last && !last.responded && Date.now() - new Date(last.at).getTime() <= ALERT_RESPONSE_MIN * 60_000) last.responded = true;
+}
+
+/** 최근 14일, 알림 3번 이상 받았는데 15분 안에 움직인 비율이 30% 미만인 시간대(시) */
+export function lowResponseHours(userId: string): { hour: number; sent: number; rate: number }[] {
+  const logs = db.sitting[userId] ?? {};
+  const byHour = new Map<number, { sent: number; ok: number }>();
+  for (const d of [todayIso(), ...pastDates(todayIso(), 13)]) {
+    for (const a of logs[d]?.alerts ?? []) {
+      const h = Number(new Date(a.at).toLocaleString("en-US", { timeZone: "Asia/Seoul", hour: "numeric", hour12: false })) % 24;
+      const v = byHour.get(h) ?? { sent: 0, ok: 0 };
+      v.sent += 1; if (a.responded) v.ok += 1;
+      byHour.set(h, v);
+    }
+  }
+  return Array.from(byHour.entries())
+    .filter(([, v]) => v.sent >= 3 && v.ok / v.sent < 0.3)
+    .map(([hour, v]) => ({ hour, sent: v.sent, rate: Math.round((v.ok / v.sent) * 100) / 100 }))
+    .sort((a, b) => a.hour - b.hour);
+}
+
+// ---------- 계정 삭제 / 내보내기 ----------
+
+export function deleteUser(userId: string) {
+  delete db.users[userId];
+  delete db.sitting[userId];
+  delete db.state[userId];
+  delete db.schedule[userId];
+  delete db.reminders[userId];
+  delete db.pushSubs[userId];
+  save(db);
+}
+
+/** 파일럿 분석용: 날짜별 요약 CSV (개인 식별 정보 없음) */
+export function exportCsv(userId: string) {
+  const logs = db.sitting[userId] ?? {};
+  const rows = [["date", "plan_sit_min", "plan_source", "goal", "stand_count", "stand_verified", "seated_count", "total_count", "active_min", "segments", "sit_min_estimate", "sit_min_self", "unknown_min", "longest_sit_min", "alerts", "alerts_responded"].join(",")];
+  for (const [date, log] of Object.entries(logs).sort(([a], [b]) => a.localeCompare(b))) {
+    const sm = summaryOf(userId, date, log);
+    const segs = log.segments ?? [];
+    const mins = (src: SitSource) => segs.filter((g) => g.source === src).reduce((a, g) => a + (new Date(g.end).getTime() - new Date(g.start).getTime()) / 60000, 0);
+    const valid = segs.filter((g) => g.source !== "unknown").map((g) => (new Date(g.end).getTime() - new Date(g.start).getTime()) / 60000);
+    const verified = (log.moves ?? []).filter((m) => m.check === "verified").length;
+    rows.push([date, sm.plannedSitMin ?? "", sm.planSource, sm.goal, sm.standCount, verified, sm.seatedCount, sm.totalCount, sm.activeMin, segs.length,
+      Math.round(mins("estimate")), Math.round(mins("self")), Math.round(mins("unknown")), valid.length ? Math.round(Math.max(...valid)) : "",
+      log.alerts?.length ?? 0, log.alerts?.filter((a) => a.responded).length ?? 0].join(","));
+  }
+  return rows.join("\n") + "\n";
 }
 
 export function getCurrentSegment(userId: string): { start: string; source: SitSource } | null {
@@ -383,7 +480,7 @@ function bumpMaxContinuous(userId: string, dayLog: DayLog) {
  * 움직임 기록. 일어나서 한 동작만 연속 좌식을 끝낸다 (앉아서 한 동작은 좌식이 이어짐).
  * 직전 연속 좌식 시간(추정) = (지금 − 마지막 기립) − 운동 시간.
  */
-export function markMoved(userId: string, exerciseId: string, durationSec: number) {
+export function markMoved(userId: string, exerciseId: string, durationSec: number, check?: MoveRecord["check"]) {
   const ex = EXERCISE_BY_ID[exerciseId];
   if (!ex) return null;
   const date = todayIso();
@@ -398,11 +495,12 @@ export function markMoved(userId: string, exerciseId: string, durationSec: numbe
   if (standing) {
     if (trackingOn && priorSitSec > (dayLog.maxContinuousSeconds ?? 0)) dayLog.maxContinuousSeconds = priorSitSec;
     if (trackingOn) closeSegment(userId, dayLog, Date.now() - dur * 1000);
+    markAlertResponded(dayLog);
     // 움직인 뒤 다시 앉는 건 자동으로 추정 (보류 알림도 취소)
-    db.state[userId] = { ...db.state[userId], lastMovedAt: new Date().toISOString(), sitSource: "estimate", held: undefined };
+    db.state[userId] = { ...db.state[userId], lastMovedAt: new Date().toISOString(), sitSource: "estimate", held: undefined, unseenSec: 0 };
   }
   if (!dayLog.moves) dayLog.moves = movesOf(dayLog).slice(); // 예전 기록이 있으면 형식 변환
-  dayLog.moves.push({ at: new Date().toISOString(), exerciseId, durationSec: dur, priorSitSec });
+  dayLog.moves.push({ at: new Date().toISOString(), exerciseId, durationSec: dur, priorSitSec, ...(check ? { check } : {}) });
   dayLog.movementCount += 1;
   save(db);
   return dayLog;
@@ -434,6 +532,7 @@ export function addHeartbeatSeconds(userId: string, seconds: number) {
   const userLog = (db.sitting[userId] ??= {});
   const dayLog = (userLog[date] ??= { totalSeconds: 0, movementCount: 0 });
   dayLog.totalSeconds += safeSeconds;
+  touchSeen(userId);
   bumpMaxContinuous(userId, dayLog);
   save(db);
   return dayLog;
@@ -451,7 +550,7 @@ export function getMonthLog(userId: string, month: string) {
       maxContinuousSeconds: log.maxContinuousSeconds ?? 0,
       edema: log.edema ?? null,
       summary: summaryOf(userId, date, log),
-      segments: log.segments ?? [],
+      segments: [...(log.segments ?? []), ...scheduleSegments(userId, date)],
     }));
 }
 
@@ -662,6 +761,11 @@ export function replaceIcsBlocks(userId: string, blocks: Omit<ScheduleBlock, "id
 // ---------- 웹 푸시 ----------
 
 export function getVapid() { return db.vapid; }
+export function getSecret(): string {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  if (!db.secret) { db.secret = crypto.randomBytes(32).toString("hex"); save(db); }
+  return db.secret;
+}
 export function setVapid(v: { publicKey: string; privateKey: string }) { db.vapid = v; save(db); }
 
 export function addPushSub(userId: string, sub: PushSub) {

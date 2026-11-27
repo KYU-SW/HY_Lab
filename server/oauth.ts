@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { Express, Request, Response } from "express";
-import { findOrCreateSocialUser, publicUser } from "./db";
+import { findOrCreateSocialUser, getUser, publicUser } from "./db";
+import { authed } from "./auth";
 
 type Provider = "kakao" | "naver" | "apple";
 type Profile = { id: string; email: string | null; name: string };
@@ -136,6 +137,8 @@ export function registerOAuthRoutes(app: Express) {
     const t = tickets.get(String(req.body?.ticket ?? ""));
     tickets.delete(String(req.body?.ticket ?? ""));
     if (!t || t.exp < Date.now()) return res.status(401).json({ error: "로그인 정보가 만료됐어요. 다시 시도해주세요." });
-    res.json({ user: t.user });
+    const u = getUser(t.user.id);
+    if (!u) return res.status(401).json({ error: "로그인 정보가 만료됐어요. 다시 시도해주세요." });
+    res.json(authed(u));
   });
 }
