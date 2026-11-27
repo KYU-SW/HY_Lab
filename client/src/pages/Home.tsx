@@ -370,33 +370,8 @@ function AuthScreen({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const googleBtnRef = useRef<HTMLDivElement>(null);
-  const onGoogleRef = useRef(onGoogle);
-  onGoogleRef.current = onGoogle;
 
   const canSubmit = mode === "login" ? email.trim() && password : nickname.trim() && email.trim() && password.length >= 4;
-
-  // 구글 로그인 버튼 (클라이언트 ID가 서버에 설정돼 있을 때만)
-  useEffect(() => {
-    if (!googleClientId) return;
-    let cancelled = false;
-    const init = () => {
-      const g = (window as any).google?.accounts?.id;
-      if (!g || cancelled || !googleBtnRef.current) return;
-      g.initialize({ client_id: googleClientId, callback: (r: { credential: string }) => onGoogleRef.current(r.credential) });
-      g.renderButton(googleBtnRef.current, { theme: "outline", size: "large", width: 300, text: "continue_with", locale: "ko" });
-    };
-    if ((window as any).google?.accounts?.id) {
-      init();
-    } else {
-      const sc = document.createElement("script");
-      sc.src = "https://accounts.google.com/gsi/client";
-      sc.async = true;
-      sc.onload = init;
-      document.head.appendChild(sc);
-    }
-    return () => { cancelled = true; };
-  }, [googleClientId]);
 
   return (
     <div className="screen auth-screen">
@@ -431,20 +406,6 @@ function AuthScreen({
         >
           {submitting ? "처리 중..." : mode === "login" ? "로그인" : "시작하기"}<ArrowRight size={17} />
         </button>
-      </div>
-      <div className="social-divider"><span>또는 간편하게</span></div>
-      <div className="social-single">
-        {googleClientId
-          ? <div ref={googleBtnRef} />
-          : <button className="social-disabled" disabled><span className="social-symbol google">G</span>구글로 계속하기 · 서버 설정 필요</button>}
-      </div>
-      <div className="social-list">
-        {([
-          ["kakao", "카카오로 계속하기", "social-kakao", "K"],
-          ["naver", "네이버로 계속하기", "social-naver", "N"],
-        ] as const).map(([key, label, cls, sym]) => providers[key]
-          ? <a key={key} className={`social-link ${cls}`} href={`/api/auth/${key}/start`}><span className="social-symbol">{sym}</span>{label}</a>
-          : <button key={key} className={`social-link social-disabled ${cls}`} disabled><span className="social-symbol">{sym}</span>{label} · 서버 설정 필요</button>)}
       </div>
       <p className="terms-copy">계속하면 <u>이용약관</u> 및 <u>개인정보 처리방침</u>에<br />동의하는 것으로 간주됩니다.</p>
     </div>
