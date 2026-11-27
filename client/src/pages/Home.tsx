@@ -551,13 +551,15 @@ function TimerScreen({
     () => recommend({ categories: movement.categories, place, availableMin, profile, history: today.history }),
     [movement, place, availableMin, profile, today.history],
   );
-  const [picked, setPicked] = useState<string | null>(null);
-  const exerciseId = picked && rec.list.some((r) => r.id === picked) ? picked : rec.list[0]?.id ?? null;
+  const [skip, setSkip] = useState(0); // "다른 걸로 바꾸기"를 누른 횟수 → 다음 순위
+  const exerciseId = rec.list.length ? rec.list[skip % rec.list.length].id : null;
   const [showHidden, setShowHidden] = useState(false);
   const ex = exerciseId ? EXERCISE_BY_ID[exerciseId] : null;
   const required = ex ? RECOMMENDED_SEC[ex.category] : 60;
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => { const timer = window.setInterval(() => setElapsed((value) => value + 1), 1000); return () => window.clearInterval(timer); }, []);
+  useEffect(() => { setSkip(0); }, [place, availableMin]);
+  useEffect(() => { setElapsed(0); }, [exerciseId]); // 운동이 바뀌면 타이머 처음부터
   const done = elapsed >= required;
   const progress = Math.min(1, elapsed / required);
   const shown = done ? elapsed - required : required - elapsed;
@@ -591,13 +593,14 @@ function TimerScreen({
     {ex ? <>
       <div className={`timer-circle timer-circle--${movement.accent}`} style={{ "--progress": `${progress * 360}deg` } as React.CSSProperties}><div className="timer-circle-inner"><span>{done ? "권장 시간 달성 · 계속해도 좋아요" : "권장 시간까지"}</span><strong>{fmt}</strong><small><i /> {done ? "더 해도 좋아요" : "천천히 따라 해보세요"}</small></div></div>
       <div className="gain-card gain-card--rows"><div className="gain-head"><span>일어나기</span><strong>{standNote}</strong></div></div>
-      <div className="movement-detail-card"><div className={`movement-detail-icon movement-detail-icon--${movement.accent}`}><Icon size={23} /></div><div><span>{CATEGORY_LABEL[ex.category]} · 권장 {Math.round(required / 60)}분 · {BAND_LABEL[band]} {ex.met} MET{kcal != null && elapsed > 0 ? ` · 약 ${kcal}kcal` : ""}</span><strong>{ex.name}</strong><p>{ex.desc}</p>{reason && <p className="rec-reason"><Sparkles size={12} /> 추천 이유: {reason}</p>}<button className="rec-exclude" onClick={() => { onExclude(ex.id); setPicked(null); }}>이 운동은 추천에서 빼기</button></div></div>
+      <div className="movement-detail-card"><div className={`movement-detail-icon movement-detail-icon--${movement.accent}`}><Icon size={23} /></div><div><span>{CATEGORY_LABEL[ex.category]} · 권장 {Math.round(required / 60)}분 · {BAND_LABEL[band]} {ex.met} MET{kcal != null && elapsed > 0 ? ` · 약 ${kcal}kcal` : ""}</span><strong>{ex.name}</strong><p>{ex.desc}</p>{reason && <p className="rec-reason"><Sparkles size={12} /> 추천 이유: {reason}</p>}</div></div>
+      <div className="rec-actions"><button className="secondary-button" disabled={rec.list.length < 2} onClick={() => setSkip((v) => v + 1)}><RotateCcw size={15} /> 이 운동은 안 할래요</button><button className="rec-exclude" onClick={() => onExclude(ex.id)}>다시 추천 안 함</button></div>
     </> : <div className="gain-card"><small>지금 조건에서 할 수 있는 운동이 없어요. 장소나 시간을 바꿔보세요.</small></div>}
-    <div className="exercise-picker"><div className="exercise-group"><span className="exercise-group-label">나에게 맞는 순서</span><div className="action-chips action-chips--wrap">{rec.list.map((o, i) => <button key={o.id} className={o.id === exerciseId ? "is-on" : ""} onClick={() => setPicked(o.id)}>{i === 0 ? "★ " : ""}{EXERCISE_BY_ID[o.id].name}</button>)}</div></div>
+    <div className="exercise-picker">{rec.list.length > 1 && <small className="rec-count">지금 조건에 맞는 운동 {rec.list.length}개 중 {(skip % rec.list.length) + 1}순위</small>}
       {rec.hidden.length > 0 && <button className="goal-more" onClick={() => setShowHidden((v) => !v)}>{showHidden ? "접기" : `지금 추천하지 않는 운동 ${rec.hidden.length}개`}</button>}
       {showHidden && <ul className="rec-hidden">{rec.hidden.map((h) => <li key={h.id}>{EXERCISE_BY_ID[h.id].name} · {h.reason}</li>)}</ul>}
     </div>
-    <div className="timer-actions"><button className="secondary-button" onClick={onBack}><RotateCcw size={16} /> 다시 고르기</button><button className="primary-button" disabled={!ex || elapsed < 10} onClick={() => ex && onComplete(ex.id, elapsed)}><Check size={17} /> 완료했어요</button></div>
+    <div className="timer-actions"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> 상황 다시 고르기</button><button className="primary-button" disabled={!ex || elapsed < 10} onClick={() => ex && onComplete(ex.id, elapsed)}><Check size={17} /> 완료했어요</button></div>
     <p className="medical-note"><Info size={13} /> 강도는 2024 신체활동 강도 목록(Compendium) 값이에요. 추천은 내 몸 정보·평소 운동 수준·불편한 부위·최근 기록으로 순서를 정해요. 통증이 있다면 멈추고 전문가와 상담하세요.</p>
   </div>;
 }
