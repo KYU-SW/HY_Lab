@@ -179,7 +179,7 @@ export type DaySummary = {
   standVerified: number; // 그중 센서로 움직임이 확인된 횟수
   standRaw: number; // 일어나서 한 동작 전체 횟수 (30분 중복 포함)
   seatedCount: number; // 앉아서 한 동작 (기록만)
-  totalCount: number; // 전체 실천 횟수
+  totalCount: number; // 오늘 한 동작 (서서 + 앉아서 전부)
   goal: number; // 오늘 일어나기 목표
   goalMin: number;
   goalRec: number | null;
